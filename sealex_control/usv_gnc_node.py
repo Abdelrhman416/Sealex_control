@@ -222,6 +222,15 @@ class USVGNCNode(Node):
             NavSatFix, '/usv/origin',
             self.origin_callback, 10)
 
+        # [L4] Queue control
+        self.create_subscription(
+            NavSatFix, '/usv/queue_add',
+            self.queue_add_callback, 10)
+            
+        self.create_subscription(
+            Bool, '/usv/mission_start',
+            self.mission_start_callback, 10)
+        
         # Dynamic target from web dashboard
         self.target_sub = self.create_subscription(
             NavSatFix, '/usv/target',
@@ -293,11 +302,12 @@ class USVGNCNode(Node):
         self.origin_lon = None
 
         # ── Mission state ──────────────────────────────────────────────────
+        self.waypoint_queue = []   # List of (x, y) tuples
         self.target_x       = None
         self.target_y       = None
-        self.mission_active = False
         self.wp_prev_x      = None
         self.wp_prev_y      = None
+        self.mission_active = False
 
         # ── [NEW] E-STOP state (dual: SW + HW) ────────────────────────────
         self.sw_estop_active = False   # triggered by /usv/estop
@@ -501,6 +511,36 @@ class USVGNCNode(Node):
     # Watchdog
     # =========================================================================
 
+    # =========================================================================
+    # [L4] Waypoint queue helpers
+    # =========================================================================
+
+    def _activate_next_waypoint(self) -> bool:
+        """
+        Pop the next WP from the queue.
+        Sets wp_prev to the just-reached WP so LOS continues smoothly.
+        Returns True if a new WP was activated, False if queue is empty.
+        """
+        if not self.waypoint_queue:
+            return False
+
+        # Completed WP becomes the new LOS path-start
+        self.wp_prev_x = self.target_x
+        self.wp_prev_y = self.target_y
+
+        self.target_x, self.target_y = self.waypoint_queue.pop(0)
+        
+        # Reset integrators for the new segment
+        self.prev_e     = 0.0
+        self.e_integral = 0.0
+        self.v_integral = 0.0
+
+        self.get_logger().info(
+            f'[QUEUE] Next WP: X={self.target_x:.2f} Y={self.target_y:.2f}  '
+            f'({len(self.waypoint_queue)} remaining)')
+        return True
+
+
     def _sensors_healthy(self) -> bool:
         """Return True only if both GPS and IMU are receiving data."""
         gps_age = self._sensor_age(self.last_gps_time)
@@ -669,25 +709,79 @@ class USVGNCNode(Node):
                 'PI speed controller ACTIVE.\n'
                 '      Open-loop fallback DISABLED while EKF is alive.')
 
+    # =========================================================================
+    # Callbacks — mission / target
+    # =========================================================================
+
     def target_callback(self, msg: NavSatFix) -> None:
+        """Single immediate WP — clears queue, backward-compatible."""
         if self.any_estop:
-            self.get_logger().warn('[TARGET] E-STOP active — ignoring waypoint.')
+            self.get_logger().warn('[TARGET] E-STOP active — ignoring.')
             return
         if not self.origin_set or self.origin_lat is None or self.origin_lon is None:
-            self.get_logger().warn('[TARGET] No origin — publish to /usv/origin first.')
+            self.get_logger().warn('[TARGET] No origin — publish /usv/origin first.')
             return
+            
+        self.waypoint_queue.clear()
         self.wp_prev_x = self.x
         self.wp_prev_y = self.y
-
         self.target_x, self.target_y = gps_to_xy(
-            msg.latitude, msg.longitude,
-            self.origin_lat, self.origin_lon)
+            msg.latitude, msg.longitude, self.origin_lat, self.origin_lon)
+            
         self.mission_active = True
         self.prev_e         = 0.0
-        self.v_integral     = 0.0   # reset speed integrator on new waypoint
+        self.e_integral     = 0.0
+        self.v_integral     = 0.0
+        
         self.get_logger().info(
-            f'[TARGET] ✓ New waypoint → '
-            f'X={self.target_x:.3f} m  Y={self.target_y:.3f} m  Mission ACTIVE.')
+            f'[TARGET] Immediate WP: X={self.target_x:.3f} Y={self.target_y:.3f}')
+
+    def queue_add_callback(self, msg: NavSatFix) -> None:
+        """[L4] Append one WP to the mission queue."""
+        if not self.origin_set or self.origin_lat is None or self.origin_lon is None:
+            self.get_logger().warn('[QUEUE] No origin — publish /usv/origin first.')
+            return
+            
+        wx, wy = gps_to_xy(
+            msg.latitude, msg.longitude, self.origin_lat, self.origin_lon)
+        self.waypoint_queue.append((wx, wy))
+        
+        self.get_logger().info(
+            f'[QUEUE] Added WP: X={wx:.2f} Y={wy:.2f}  '
+            f'(queue size: {len(self.waypoint_queue)})')
+
+    def mission_start_callback(self, msg: Bool) -> None:
+        """[L4] True: start queue.  False: clear queue and stop."""
+        if not msg.data:
+            self.waypoint_queue.clear()
+            self.mission_active = False
+            self.target_x = self.target_y = None
+            self.wp_prev_x = self.wp_prev_y = None
+            self.stop_boat()
+            self.get_logger().info('[QUEUE] Mission cleared.')
+            return
+
+        if self.any_estop:
+            self.get_logger().warn('[QUEUE] E-STOP active — cannot start.')
+            return
+        if not self.origin_set:
+            self.get_logger().warn('[QUEUE] No origin set.')
+            return
+        if not self.waypoint_queue:
+            self.get_logger().warn('[QUEUE] Queue is empty — add waypoints first.')
+            return
+
+        self.wp_prev_x = self.x
+        self.wp_prev_y = self.y
+        self.target_x, self.target_y = self.waypoint_queue.pop(0)
+        self.mission_active = True
+        self.prev_e         = 0.0
+        self.e_integral     = 0.0
+        self.v_integral     = 0.0
+        
+        self.get_logger().info(
+            f'[QUEUE] Mission STARTED — WP1: X={self.target_x:.2f} Y={self.target_y:.2f}  '
+            f'({len(self.waypoint_queue)} more in queue)')
 
     # =========================================================================
     # Main control loop  (10 Hz)
@@ -768,13 +862,19 @@ class USVGNCNode(Node):
             self.target_x - self.x,
             self.target_y - self.y)
 
+        # Waypoint acceptance
         if distance < self.R_accept:
             self.get_logger().info(
-                f'\n>>> TARGET REACHED ({self.target_x:.2f}, {self.target_y:.2f})!'
-                f'  Stopping.  Waiting for next /usv/target. <<<\n')
-            self.stop_boat()
-            self.mission_active = False
-            self.v_integral     = 0.0
+                f'\n[WP REACHED] ({self.target_x:.2f}, {self.target_y:.2f})  '
+                f'dist={distance:.2f}m\n')
+                
+            if not self._activate_next_waypoint():
+                self.get_logger().info(
+                    '\n[MISSION COMPLETE] All waypoints reached.\n')
+                self.stop_boat()
+                self.mission_active = False
+                self.target_x = self.target_y = None
+                self.wp_prev_x = self.wp_prev_y = None
             return
 
         ## [L4] LOS desired heading

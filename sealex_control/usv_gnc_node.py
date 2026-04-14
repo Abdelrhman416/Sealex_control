@@ -1,0 +1,834 @@
+#!/usr/bin/env python3
+"""
+SEALEX GNC Node — Level 3 (Hardware-Ready)
+===========================================
+Platform  : WAM-V / VRX 3.1.0 / Gazebo Garden / ROS 2 Humble
+Author    : SEALEX Team
+
+Upgrade Levels
+--------------
+L1  True IMU heading  — quaternion → yaw (replaces course-over-ground)
+L2  Dual-sensor watchdog — GPS + IMU timeouts with one-shot logging & recovery
+L3  EKF integration  — subscribes to /odometry/filtered (robot_localization).
+    Velocity feedback extracted from EKF odometry enables closed-loop speed
+    control (PI surge controller).  Falls back gracefully to open-loop if the
+    EKF node is not running.
+
+New in this version (Critical hardware-readiness additions)
+-----------------------------------------------------------
+• Hardware E-STOP  (/usv/hw_estop, std_msgs/Bool)
+    Separate from the software E-STOP so a physical kill-switch relay or RC
+    channel can be wired independently. Both SW and HW E-STOPs must be clear
+    before autonomous motion resumes.
+
+• RC Override  (/usv/rc_override, geometry_msgs/Twist)
+    linear.x  : [-1 .. +1]  forward/reverse speed scale
+    angular.z : [-1 .. +1]  yaw-rate scale
+    If a message arrives within RC_TIMEOUT_SEC the node bypasses autonomous
+    control completely and maps the RC command directly to thrusters.
+    Override clears automatically when messages stop arriving.
+
+• Thruster Calibration Layer
+    Every thrust value passes through apply_thrust_calibration() before
+    publishing, which applies:
+      1. Per-side trim offset  (compensates mechanical/motor asymmetry)
+      2. Deadband              (zero-output below threshold — prevents
+                                hunting and protects ESC/motor from
+                                continuous micro-commands)
+      3. Nonlinear power curve (exponent > 1 → finer low-speed control)
+    All calibration constants are at the top of the file and are the first
+    things to tune on real hardware.
+
+• Closed-loop surge speed (PI) when EKF is running
+    When /odometry/filtered is alive the node reads vx,vy from the Odometry
+    message, projects them into the boat's body frame to obtain actual surge
+    speed, and drives a PI speed error to thrust. Falls back to open-loop
+    (velocity * OPEN_LOOP_GAIN) when EKF is unavailable.
+
+Topics subscribed
+-----------------
+  /wamv/sensors/gps/gps/fix          sensor_msgs/NavSatFix
+  /wamv/sensors/imu/imu/data         sensor_msgs/Imu
+  /odometry/filtered                 nav_msgs/Odometry        (robot_localization)
+  /usv/origin                        sensor_msgs/NavSatFix    (one-way door)
+  /usv/target                        sensor_msgs/NavSatFix    (from dashboard)
+  /usv/estop                         std_msgs/Bool            (software E-STOP)
+  /usv/hw_estop                      std_msgs/Bool            (hardware E-STOP)
+  /usv/rc_override                   geometry_msgs/Twist      (RC manual override)
+
+Topics published
+----------------
+  /wamv/thrusters/left/thrust        std_msgs/Float64
+  /wamv/thrusters/right/thrust       std_msgs/Float64
+"""
+
+import math
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import NavSatFix, Imu
+from nav_msgs.msg import Odometry
+from std_msgs.msg import Float64, Bool
+from geometry_msgs.msg import Twist
+
+# ===========================================================================
+# Physical / world constants
+# ===========================================================================
+EARTH_RADIUS = 6_371_000.0      # metres
+
+# ===========================================================================
+# Watchdog timeouts  (seconds)
+# ===========================================================================
+GPS_TIMEOUT_SEC = 1.0
+IMU_TIMEOUT_SEC = 0.5
+EKF_TIMEOUT_SEC = 0.5           # if EKF goes silent, revert to open-loop speed
+RC_TIMEOUT_SEC  = 0.5           # RC override auto-clears after this silence
+
+# ===========================================================================
+# Slow-zone / alignment guidance parameters
+# ===========================================================================
+SLOW_ZONE_M      = 8.0                  # distance at which deceleration begins
+MIN_SPEED        = 0.3                  # minimum forward speed inside slow zone
+ALIGN_THRESHOLD  = math.radians(40)    # heading error → cut speed
+
+# ===========================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+#  THRUSTER CALIBRATION — Tune these FIRST on real hardware
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#  THRUST_DEADBAND
+#    Minimum command magnitude that actually causes thruster movement.
+#    In simulation keep at 0.  On real hardware start at ~5 and increase
+#    until the boat stops hunting (oscillating at zero command).
+#
+#  LEFT_TRIM_OFFSET / RIGHT_TRIM_OFFSET
+#    Positive value adds to that side's thrust.
+#    If the boat drifts LEFT with equal commands → increase LEFT_TRIM_OFFSET
+#    (or decrease RIGHT_TRIM_OFFSET).  Tune in 1-unit steps.
+#
+#  THRUST_NONLIN_EXP
+#    1.0  = linear mapping  (simulation default)
+#    1.5  = gentler at low speed, more punch at high — good starting point
+#           for real Blue Robotics T200 thrusters
+#    2.0  = very non-linear; gives fine low-speed control at the cost of
+#           requiring larger commands for full thrust
+# ===========================================================================
+THRUST_DEADBAND    = 0.0    # [N-equivalent]  simulation: 0 / real: start ~5
+LEFT_TRIM_OFFSET   = 0.0    # [N-equivalent]  positive → more left thrust
+RIGHT_TRIM_OFFSET  = 0.0    # [N-equivalent]  positive → more right thrust
+THRUST_NONLIN_EXP  = 1.0    # 1.0 = linear.   Real hardware: try 1.5
+MAX_THRUSTER_N     = 100.0  # absolute clamp on final output
+
+# ===========================================================================
+# Open-loop fallback gain (used when EKF is not running)
+# ===========================================================================
+OPEN_LOOP_GAIN = 45.0   # maps m/s command → thrust units  (empirical)
+
+# ===========================================================================
+# Closed-loop speed controller gains (active when EKF is running)
+# ===========================================================================
+KP_V = 40.0     # proportional gain  (surge speed error → thrust)
+KI_V =  5.0     # integral gain
+V_INTEGRAL_LIMIT = 30.0  # anti-windup clamp on integral accumulator
+
+
+# ===========================================================================
+# Pure functions
+# ===========================================================================
+
+def gps_to_xy(lat: float, lon: float,
+              origin_lat: float, origin_lon: float) -> tuple[float, float]:
+    """Flat-earth approximation. Valid for distances < 10 km."""
+    d_lat = math.radians(lat - origin_lat)
+    d_lon = math.radians(lon - origin_lon)
+    x = d_lon * EARTH_RADIUS * math.cos(math.radians(origin_lat))
+    y = d_lat * EARTH_RADIUS
+    return x, y
+
+
+def clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def apply_thrust_calibration(raw: float,
+                              trim: float,
+                              deadband: float,
+                              exp: float,
+                              max_thrust: float) -> float:
+    """
+    Transform a raw thrust command into a calibrated output.
+
+    Steps
+    -----
+    1. Add per-side trim offset.
+    2. Zero-out anything inside the deadband.
+    3. Apply a nonlinear power curve (sign preserved).
+    4. Clamp to [-max_thrust, +max_thrust].
+
+    Parameters
+    ----------
+    raw       : Thrust in nominal thrust units before calibration.
+    trim      : Per-side trim offset (positive → more thrust on this side).
+    deadband  : Commands with |val| < deadband are zeroed.
+    exp       : Power-curve exponent.  1.0 = linear.
+    max_thrust: Hard output limit.
+    """
+    val = raw + trim
+
+    # Deadband
+    if abs(val) < deadband:
+        return 0.0
+
+    sign      = 1.0 if val > 0.0 else -1.0
+    span      = max_thrust - deadband           # usable range above deadband
+    above_db  = abs(val) - deadband             # distance above deadband
+    norm      = clamp(above_db / span, 0.0, 1.0)
+    curved    = math.pow(norm, exp) * span + deadband
+    return clamp(sign * curved, -max_thrust, max_thrust)
+
+
+# ===========================================================================
+# GNC Node
+# ===========================================================================
+
+class USVGNCNode(Node):
+
+    def __init__(self):
+        super().__init__('usv_gnc_node')
+
+        # ── Subscribers ────────────────────────────────────────────────────
+
+        # Raw GPS — always subscribed for position (and as EKF fallback)
+        self.gps_sub = self.create_subscription(
+            NavSatFix, '/wamv/sensors/gps/gps/fix',
+            self.gps_callback, 10)
+
+        # Raw IMU — always subscribed for heading
+        self.imu_sub = self.create_subscription(
+            Imu, '/wamv/sensors/imu/imu/data',
+            self.imu_callback, 10)
+
+        # ── [L3] EKF filtered odometry ─────────────────────────────────────
+        # Published by robot_localization ekf_node.
+        # Used for velocity feedback (closed-loop speed controller).
+        # If this topic is silent, the node falls back to open-loop thrust.
+        self.ekf_sub = self.create_subscription(
+            Odometry, '/odometry/filtered',
+            self.ekf_callback, 10)
+
+        # Origin lock (one-way door)
+        self.origin_sub = self.create_subscription(
+            NavSatFix, '/usv/origin',
+            self.origin_callback, 10)
+
+        # Dynamic target from web dashboard
+        self.target_sub = self.create_subscription(
+            NavSatFix, '/usv/target',
+            self.target_callback, 10)
+
+        # ── [NEW] Software E-STOP ──────────────────────────────────────────
+        # std_msgs/Bool — True engages, False clears.
+        # Published by the web dashboard or any ROS node.
+        self.sw_estop_sub = self.create_subscription(
+            Bool, '/usv/estop',
+            self.sw_estop_callback, 10)
+
+        # ── [NEW] Hardware E-STOP ──────────────────────────────────────────
+        # Separate topic for a physical kill switch, RC channel relay, or
+        # a safety monitor node.  Has IDENTICAL effect to SW E-STOP but
+        # is tracked independently so you can see WHICH one fired.
+        self.hw_estop_sub = self.create_subscription(
+            Bool, '/usv/hw_estop',
+            self.hw_estop_callback, 10)
+
+        # ── [NEW] RC Override ──────────────────────────────────────────────
+        # geometry_msgs/Twist published by an RC bridge node.
+        #   linear.x  ∈ [-1, +1]  — forward/reverse throttle
+        #   angular.z ∈ [-1, +1]  — yaw rate (left/right)
+        # Override is active while messages arrive within RC_TIMEOUT_SEC.
+        # It BYPASSES autonomous control completely but CANNOT bypass E-STOP.
+        self.rc_sub = self.create_subscription(
+            Twist, '/usv/rc_override',
+            self.rc_callback, 10)
+
+        # ── Publishers ─────────────────────────────────────────────────────
+        self.left_pub  = self.create_publisher(
+            Float64, '/wamv/thrusters/left/thrust',  10)
+        self.right_pub = self.create_publisher(
+            Float64, '/wamv/thrusters/right/thrust', 10)
+
+        # ── Control-loop timer ─────────────────────────────────────────────
+        self.dt           = 0.1
+        self.timer        = self.create_timer(self.dt, self.control_loop)
+        self.print_counter = 0
+
+        # ── Raw sensor state ───────────────────────────────────────────────
+        self.x   = 0.0
+        self.y   = 0.0
+        self.psi = 0.0          # heading from IMU (radians)
+
+        self.gps_ready = False
+        self.imu_ready = False
+
+        self.last_gps_time = self.get_clock().now()
+        self.last_imu_time = self.get_clock().now()
+
+        self._gps_watchdog_active = False
+        self._imu_watchdog_active = False
+
+        # ── [L3] EKF state ─────────────────────────────────────────────────
+        self.ekf_ready      = False
+        self.ekf_vx_world   = 0.0   # velocity in world (odom) frame — east
+        self.ekf_vy_world   = 0.0   # velocity in world (odom) frame — north
+        self.last_ekf_time  = self.get_clock().now()
+        self._ekf_watchdog_active = False
+
+        # PI speed controller state
+        self.v_integral = 0.0
+
+        # ── Origin lock ────────────────────────────────────────────────────
+        self.origin_set = False
+        self.origin_lat = None
+        self.origin_lon = None
+
+        # ── Mission state ──────────────────────────────────────────────────
+        self.target_x       = None
+        self.target_y       = None
+        self.mission_active = False
+
+        # ── [NEW] E-STOP state (dual: SW + HW) ────────────────────────────
+        self.sw_estop_active = False   # triggered by /usv/estop
+        self.hw_estop_active = False   # triggered by /usv/hw_estop
+
+        # ── [NEW] RC Override state ────────────────────────────────────────
+        self.rc_override_active = False
+        self.rc_linear          = 0.0   # scaled forward command [-1, +1]
+        self.rc_angular         = 0.0   # scaled yaw command     [-1, +1]
+        self.last_rc_time       = None
+
+        # ── Speed / mission params ─────────────────────────────────────────
+        self.v_desired = 2.0   # cruise speed m/s
+        self.R_accept  = 1.5   # waypoint acceptance radius m
+
+        # ── Heading controller gains ───────────────────────────────────────
+        self.Kp               = 1.2
+        self.Kd               = 1.0
+        self.prev_e           = 0.0
+        self.max_angular_speed = 0.8   # rad/s
+
+        # ── Thruster limits ────────────────────────────────────────────────
+        self.max_linear_speed = 2.0
+        self.L = 2.0    # ← MEASURE THIS on the real WAM-V (thruster separation, m)
+
+        # ── Start-up banner ────────────────────────────────────────────────
+        self.get_logger().info(
+            '\n'
+            '╔══════════════════════════════════════════╗\n'
+            '║   SEALEX GNC Node  —  Level 3 ACTIVE     ║\n'
+            '║   EKF: waiting for /odometry/filtered    ║\n'
+            '║   Publish /usv/origin to unlock          ║\n'
+            '╚══════════════════════════════════════════╝'
+        )
+
+    # =========================================================================
+    # Properties
+    # =========================================================================
+
+    @property
+    def any_estop(self) -> bool:
+        """True if ANY E-STOP (SW or HW) is currently active."""
+        return self.sw_estop_active or self.hw_estop_active
+
+    @property
+    def ekf_alive(self) -> bool:
+        """True if the EKF topic is healthy right now."""
+        if not self.ekf_ready:
+            return False
+        return self._sensor_age(self.last_ekf_time) < EKF_TIMEOUT_SEC
+
+    @property
+    def rc_alive(self) -> bool:
+        """True if RC override messages are arriving within timeout."""
+        if self.last_rc_time is None:
+            return False
+        return self._sensor_age(self.last_rc_time) < RC_TIMEOUT_SEC
+
+    # =========================================================================
+    # Helpers
+    # =========================================================================
+
+    def euler_from_quaternion(self, x: float, y: float,
+                               z: float, w: float) -> float:
+        """Extract yaw (heading) from a quaternion."""
+        t3 = 2.0 * (w * z + x * y)
+        t4 = 1.0 - 2.0 * (y * y + z * z)
+        return math.atan2(t3, t4)
+
+    def _sensor_age(self, last_time) -> float:
+        """Seconds since last_time."""
+        return (self.get_clock().now() - last_time).nanoseconds / 1e9
+
+    def _publish_thrust(self, left_raw: float, right_raw: float) -> None:
+        """
+        Apply thruster calibration and publish.
+        All thrust commands flow through here — single point of calibration.
+        """
+        left_cal  = apply_thrust_calibration(
+            left_raw,  LEFT_TRIM_OFFSET,  THRUST_DEADBAND,
+            THRUST_NONLIN_EXP, MAX_THRUSTER_N)
+        right_cal = apply_thrust_calibration(
+            right_raw, RIGHT_TRIM_OFFSET, THRUST_DEADBAND,
+            THRUST_NONLIN_EXP, MAX_THRUSTER_N)
+
+        msg_l = Float64(); msg_l.data = left_cal
+        msg_r = Float64(); msg_r.data = right_cal
+        self.left_pub.publish(msg_l)
+        self.right_pub.publish(msg_r)
+
+    def stop_boat(self) -> None:
+        """Publish zero thrust safely (used by E-STOP and watchdog)."""
+        try:
+            msg = Float64()
+            msg.data = 0.0
+            self.left_pub.publish(msg)
+            self.right_pub.publish(msg)
+        except Exception as ex:
+            print(f'[stop_boat] Could not publish: {ex}')
+
+    # =========================================================================
+    # [L3] Closed-loop surge speed controller (PI)
+    # =========================================================================
+
+    def _compute_thrust_for_speed(self, v_command: float) -> float:
+        """
+        Return the thrust scalar needed to achieve v_command.
+
+        When EKF is alive   → PI closed-loop  (uses measured surge speed).
+        When EKF is silent  → open-loop fallback  (v * OPEN_LOOP_GAIN).
+
+        The returned value is in the same units as OPEN_LOOP_GAIN output
+        and is passed to the differential-thrust mixing stage.
+        """
+        if self.ekf_alive:
+            # Project world-frame velocity onto boat's forward axis (body surge)
+            v_actual = (self.ekf_vx_world * math.cos(self.psi) +
+                        self.ekf_vy_world * math.sin(self.psi))
+
+            v_error = v_command - v_actual
+
+            # Integrate with anti-windup
+            self.v_integral = clamp(
+                self.v_integral + v_error * self.dt,
+                -V_INTEGRAL_LIMIT, V_INTEGRAL_LIMIT)
+
+            thrust = KP_V * v_error + KI_V * self.v_integral
+            return clamp(thrust, 0.0, MAX_THRUSTER_N)
+        else:
+            # Open-loop: reset integrator so there's no bump on EKF reconnect
+            self.v_integral = 0.0
+            return clamp(v_command * OPEN_LOOP_GAIN, 0.0, MAX_THRUSTER_N)
+
+    # =========================================================================
+    # Speed guidance (distance + heading aware)
+    # =========================================================================
+
+    def _compute_velocity_command(self, distance: float,
+                                   heading_error: float) -> float:
+        """
+        Return the desired surge speed based on proximity and alignment.
+
+        CRUISE zone  (dist ≥ SLOW_ZONE_M) : full v_desired
+        SLOW zone    (dist <  SLOW_ZONE_M) : linear ramp MIN_SPEED → v_desired
+        ALIGN penalty (|e| > ALIGN_THRESHOLD): cuts speed ≤ 85%
+          so the boat turns in place instead of arcing widely.
+        """
+        if distance >= SLOW_ZONE_M:
+            v = self.v_desired
+        else:
+            t = (distance - self.R_accept) / (SLOW_ZONE_M - self.R_accept)
+            v = MIN_SPEED + clamp(t, 0.0, 1.0) * (self.v_desired - MIN_SPEED)
+
+        abs_e = abs(heading_error)
+        if abs_e > ALIGN_THRESHOLD:
+            penalty = 1.0 - 0.85 * (abs_e - ALIGN_THRESHOLD) / (math.pi - ALIGN_THRESHOLD)
+            v *= clamp(penalty, 0.15, 1.0)
+
+        return clamp(v, 0.0, self.max_linear_speed)
+
+    # =========================================================================
+    # Watchdog
+    # =========================================================================
+
+    def _sensors_healthy(self) -> bool:
+        """Return True only if both GPS and IMU are receiving data."""
+        gps_age = self._sensor_age(self.last_gps_time)
+        imu_age = self._sensor_age(self.last_imu_time)
+
+        if gps_age >= GPS_TIMEOUT_SEC:
+            if not self._gps_watchdog_active:
+                self.get_logger().error(
+                    f'[WATCHDOG] 🔴 GPS LOST!  Last packet {gps_age:.2f}s ago.')
+                self._gps_watchdog_active = True
+            return False
+
+        if imu_age >= IMU_TIMEOUT_SEC:
+            if not self._imu_watchdog_active:
+                self.get_logger().error(
+                    f'[WATCHDOG] 🔴 IMU LOST!  Last packet {imu_age:.2f}s ago.')
+                self._imu_watchdog_active = True
+            return False
+
+        return True
+
+    # =========================================================================
+    # Callbacks — E-STOP (SW)
+    # =========================================================================
+
+    def sw_estop_callback(self, msg: Bool) -> None:
+        if msg.data:
+            if not self.sw_estop_active:
+                self.sw_estop_active = True
+                self.mission_active  = False
+                self.stop_boat()
+                self.get_logger().error(
+                    '\n⬛ [SW-ESTOP]  SOFTWARE E-STOP ENGAGED — MOTORS KILLED.\n')
+        else:
+            if self.sw_estop_active:
+                self.sw_estop_active = False
+                self.get_logger().info(
+                    '\n▶  [SW-ESTOP]  Software E-STOP cleared. '
+                    'Send a new /usv/target to resume.\n')
+
+    # =========================================================================
+    # Callbacks — E-STOP (HW)
+    # =========================================================================
+
+    def hw_estop_callback(self, msg: Bool) -> None:
+        """
+        Triggered by a physical kill switch, RC safety channel, or a
+        separate safety-monitor node publishing to /usv/hw_estop.
+
+        On real hardware, wire the kill switch to a micro that publishes
+        True on this topic when activated, False when released.
+        """
+        if msg.data:
+            if not self.hw_estop_active:
+                self.hw_estop_active = True
+                self.mission_active  = False
+                self.stop_boat()
+                self.get_logger().fatal(
+                    '\n🔴 [HW-ESTOP]  HARDWARE E-STOP TRIGGERED — MOTORS KILLED.\n'
+                    '   Check physical kill switch.\n')
+        else:
+            if self.hw_estop_active:
+                self.hw_estop_active = False
+                self.get_logger().warn(
+                    '\n⚠  [HW-ESTOP]  Hardware E-STOP cleared. '
+                    'Send a new /usv/target to resume.\n')
+
+    # =========================================================================
+    # Callbacks — RC Override
+    # =========================================================================
+
+    def rc_callback(self, msg: Twist) -> None:
+        """
+        Receive RC manual-override commands.
+
+        Publish test commands from a terminal:
+          ros2 topic pub /usv/rc_override geometry_msgs/Twist \
+            "{linear: {x: 0.5}, angular: {z: 0.3}}"
+
+        Expected range: linear.x and angular.z both in [-1, +1].
+        """
+        if self.any_estop:
+            # E-STOP has higher priority — silently ignore RC while stopped
+            return
+
+        self.rc_linear  = clamp(msg.linear.x,  -1.0, 1.0)
+        self.rc_angular = clamp(msg.angular.z, -1.0, 1.0)
+        self.last_rc_time = self.get_clock().now()
+
+        if not self.rc_override_active:
+            self.rc_override_active = True
+            self.get_logger().warn(
+                f'\n⚡ [RC-OVERRIDE]  ACTIVE — Autonomous control suspended.\n'
+                f'   linear.x={self.rc_linear:+.2f}  angular.z={self.rc_angular:+.2f}\n')
+
+    # =========================================================================
+    # Callbacks — Origin, GPS, IMU, EKF, Target
+    # =========================================================================
+
+    def origin_callback(self, msg: NavSatFix) -> None:
+        if self.origin_set:
+            self.get_logger().warn('[ORIGIN] Already locked — ignoring.')
+            return
+        self.origin_lat = msg.latitude
+        self.origin_lon = msg.longitude
+        self.origin_set = True
+        self.get_logger().info(
+            f'[ORIGIN] ✓ LOCKED — '
+            f'lat={self.origin_lat:.8f}  lon={self.origin_lon:.8f}')
+
+    def gps_callback(self, msg: NavSatFix) -> None:
+        self.last_gps_time = self.get_clock().now()
+        if self._gps_watchdog_active:
+            self.get_logger().info('[GPS] ✓ Signal recovered.')
+            self._gps_watchdog_active = False
+        if not self.origin_set or self.origin_lat is None or self.origin_lon is None:
+            return
+        self.x, self.y = gps_to_xy(
+            msg.latitude, msg.longitude,
+            self.origin_lat, self.origin_lon)
+        if not self.gps_ready:
+            self.gps_ready = True
+            self.get_logger().info(
+                f'[GPS] ✓ First fix  X={self.x:.3f} m  Y={self.y:.3f} m')
+
+    def imu_callback(self, msg: Imu) -> None:
+        self.last_imu_time = self.get_clock().now()
+        if self._imu_watchdog_active:
+            self.get_logger().info('[IMU] ✓ Signal recovered.')
+            self._imu_watchdog_active = False
+        q = msg.orientation
+        self.psi = self.euler_from_quaternion(q.x, q.y, q.z, q.w)
+        if not self.imu_ready:
+            self.imu_ready = True
+            self.get_logger().info(
+                f'[IMU] ✓ First reading  Yaw={math.degrees(self.psi):.1f}°')
+
+    def ekf_callback(self, msg: Odometry) -> None:
+        """
+        Receive filtered odometry from robot_localization ekf_node.
+
+        We use ONLY the velocity (twist) from EKF, not the position.
+        Position still comes from raw GPS + flat-earth conversion so it
+        stays consistent with the target coordinate system.
+
+        Velocity in the Odometry message is expressed in the child_frame_id
+        (typically base_link / body frame) when robot_localization is
+        configured with two_d_mode: true.  We store it as world-frame
+        equivalent by rotating back — but for 2-D surge the body-forward
+        velocity is the number we need regardless of frame.
+        """
+        # Store world-frame velocities for body-frame projection in the
+        # speed controller (psi rotation applied there).
+        self.ekf_vx_world = msg.twist.twist.linear.x
+        self.ekf_vy_world = msg.twist.twist.linear.y
+        self.last_ekf_time = self.get_clock().now()
+
+        if self._ekf_watchdog_active:
+            self.get_logger().info('[EKF] ✓ /odometry/filtered recovered — closed-loop speed active.')
+            self._ekf_watchdog_active = False
+
+        if not self.ekf_ready:
+            self.ekf_ready = True
+            self.get_logger().info(
+                '[EKF] ✓ First odometry received — '
+                'PI speed controller ACTIVE.\n'
+                '      Open-loop fallback DISABLED while EKF is alive.')
+
+    def target_callback(self, msg: NavSatFix) -> None:
+        if self.any_estop:
+            self.get_logger().warn('[TARGET] E-STOP active — ignoring waypoint.')
+            return
+        if not self.origin_set or self.origin_lat is None or self.origin_lon is None:
+            self.get_logger().warn('[TARGET] No origin — publish to /usv/origin first.')
+            return
+        self.target_x, self.target_y = gps_to_xy(
+            msg.latitude, msg.longitude,
+            self.origin_lat, self.origin_lon)
+        self.mission_active = True
+        self.prev_e         = 0.0
+        self.v_integral     = 0.0   # reset speed integrator on new waypoint
+        self.get_logger().info(
+            f'[TARGET] ✓ New waypoint → '
+            f'X={self.target_x:.3f} m  Y={self.target_y:.3f} m  Mission ACTIVE.')
+
+    # =========================================================================
+    # Main control loop  (10 Hz)
+    # =========================================================================
+
+    def control_loop(self) -> None:
+
+        # ── Priority 1: ANY E-STOP ─────────────────────────────────────────
+        if self.any_estop:
+            source = []
+            if self.sw_estop_active: source.append('SW')
+            if self.hw_estop_active: source.append('HW')
+            # Keep publishing zeros every tick while E-STOP is active
+            # so the thrusters cannot drift on from a stale command.
+            self.stop_boat()
+            return
+
+        # ── Priority 2: RC Override ────────────────────────────────────────
+        if self.rc_alive:
+            if not self.rc_override_active:
+                self.rc_override_active = True
+            self._execute_rc_override()
+            return
+        else:
+            if self.rc_override_active:
+                self.rc_override_active = False
+                self.stop_boat()
+                self.get_logger().info(
+                    '[RC-OVERRIDE] Timeout — RC lost. '
+                    'Autonomous control restored.')
+            # Fall through to autonomous ↓
+
+        # ── Priority 3: Origin lock ────────────────────────────────────────
+        if not self.origin_set:
+            self.get_logger().warn(
+                'Waiting for origin — publish NavSatFix to /usv/origin',
+                throttle_duration_sec=5.0)
+            return
+
+        # ── Priority 4: Sensor readiness ──────────────────────────────────
+        if not self.gps_ready or not self.imu_ready:
+            self.get_logger().warn(
+                f'Waiting for sensors — '
+                f'GPS:{"✓" if self.gps_ready else "✗"} '
+                f'IMU:{"✓" if self.imu_ready else "✗"}',
+                throttle_duration_sec=2.0)
+            return
+
+        # ── Priority 5: Sensor watchdog ────────────────────────────────────
+        if not self._sensors_healthy():
+            self.stop_boat()
+            return
+
+        # ── EKF watchdog (non-blocking — only affects speed source) ───────
+        if self.ekf_ready and not self.ekf_alive:
+            if not self._ekf_watchdog_active:
+                self.get_logger().warn(
+                    '[EKF] ⚠  /odometry/filtered lost — '
+                    'reverting to open-loop speed control.')
+                self._ekf_watchdog_active = True
+                self.v_integral = 0.0   # reset integrator
+
+        # ── Priority 6: No active mission ─────────────────────────────────
+        if not self.mission_active or self.target_x is None:
+            self.get_logger().info(
+                f'Sensors OK (EKF:{"✓" if self.ekf_alive else "✗ fallback"}) '
+                f'— idling, waiting for /usv/target.',
+                throttle_duration_sec=5.0)
+            return
+
+        # ── Active autonomous mission ──────────────────────────────────────
+        if self.target_x is None or self.target_y is None:
+            self.get_logger().warn(
+                'Target coordinates are None — skipping mission update.')
+            return
+
+        distance = math.hypot(
+            self.target_x - self.x,
+            self.target_y - self.y)
+
+        if distance < self.R_accept:
+            self.get_logger().info(
+                f'\n>>> TARGET REACHED ({self.target_x:.2f}, {self.target_y:.2f})!'
+                f'  Stopping.  Waiting for next /usv/target. <<<\n')
+            self.stop_boat()
+            self.mission_active = False
+            self.v_integral     = 0.0
+            return
+
+        # Desired heading and error (wrapped to [-π, π])
+        psi_desired = math.atan2(
+            self.target_y - self.y,
+            self.target_x - self.x)
+        e = math.atan2(
+            math.sin(psi_desired - self.psi),
+            math.cos(psi_desired - self.psi))
+
+        # PD heading controller
+        e_dot  = (e - self.prev_e) / self.dt
+        omega  = clamp(
+            self.Kp * e + self.Kd * e_dot,
+            -self.max_angular_speed, self.max_angular_speed)
+        self.prev_e = e
+
+        # Desired speed (guidance)
+        v_cmd = self._compute_velocity_command(distance, e)
+
+        # Thrust for that speed (closed-loop PI or open-loop)
+        thrust_fwd = self._compute_thrust_for_speed(v_cmd)
+
+        # Differential thrust mixing
+        left_raw  = thrust_fwd - omega * self.L / 2.0 * (MAX_THRUSTER_N / self.max_linear_speed)
+        right_raw = thrust_fwd + omega * self.L / 2.0 * (MAX_THRUSTER_N / self.max_linear_speed)
+
+        # Clamp raw before calibration
+        left_raw  = clamp(left_raw,  -MAX_THRUSTER_N, MAX_THRUSTER_N)
+        right_raw = clamp(right_raw, -MAX_THRUSTER_N, MAX_THRUSTER_N)
+
+        # Publish (calibration layer is inside _publish_thrust)
+        self._publish_thrust(left_raw, right_raw)
+
+        # ── Telemetry (every 10 ticks = 1 s) ──────────────────────────────
+        self.print_counter += 1
+        if self.print_counter >= 10:
+            zone      = 'SLOW  ' if distance < SLOW_ZONE_M else 'CRUISE'
+            align     = 'ALIGN' if abs(e) > ALIGN_THRESHOLD else 'OK   '
+            speed_src = 'EKF-PI' if self.ekf_alive else 'OPEN-L'
+            self.get_logger().info(
+                f'[{zone}|{align}|{speed_src}] '
+                f'Tgt:({self.target_x:.1f},{self.target_y:.1f})  '
+                f'Pose:X={self.x:.2f} Y={self.y:.2f} Yaw={math.degrees(self.psi):.1f}°  '
+                f'Dist={distance:.2f}m  '
+                f'vCmd={v_cmd:.2f} Fwd={thrust_fwd:.1f}  '
+                f'ω={omega:.2f}  '
+                f'T:L={left_raw:.1f} R={right_raw:.1f}')
+            self.print_counter = 0
+
+    # =========================================================================
+    # RC override execution
+    # =========================================================================
+
+    def _execute_rc_override(self) -> None:
+        """
+        Map RC Twist commands to thruster outputs.
+
+        Scaling:
+          forward thrust  = rc_linear  * MAX_THRUSTER_N
+          turn moment     = rc_angular * MAX_THRUSTER_N
+        Differential mixing is identical to autonomous mode.
+        Calibration layer is applied via _publish_thrust.
+        """
+        fwd_thrust = self.rc_linear  * MAX_THRUSTER_N
+        yaw_thrust = self.rc_angular * MAX_THRUSTER_N
+
+        left_raw  = clamp(fwd_thrust - yaw_thrust, -MAX_THRUSTER_N, MAX_THRUSTER_N)
+        right_raw = clamp(fwd_thrust + yaw_thrust, -MAX_THRUSTER_N, MAX_THRUSTER_N)
+
+        self._publish_thrust(left_raw, right_raw)
+
+        self.print_counter += 1
+        if self.print_counter >= 10:
+            self.get_logger().info(
+                f'[RC-OVERRIDE]  fwd={self.rc_linear:+.2f}  '
+                f'yaw={self.rc_angular:+.2f}  '
+                f'T:L={left_raw:.1f} R={right_raw:.1f}')
+            self.print_counter = 0
+
+
+# ===========================================================================
+# Entry point
+# ===========================================================================
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = USVGNCNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        print("\n>>> DEAD MAN'S SWITCH: Killing Motors! <<<")
+        node.stop_boat()
+    finally:
+        node.destroy_node()
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
+
+
+if __name__ == '__main__':
+    main()

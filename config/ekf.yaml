@@ -1,0 +1,222 @@
+# =============================================================================
+#  SEALEX — robot_localization Configuration
+#  File  : ekf.yaml
+#  Place : sealex_control/config/ekf.yaml
+# =============================================================================
+#
+#  This file configures TWO nodes from the robot_localization package:
+#
+#    1.  navsat_transform_node
+#        Converts raw GPS (NavSatFix) into a local ENU odometry message
+#        (/odometry/gps) that the EKF can consume.
+#
+#    2.  ekf_node   (Extended Kalman Filter)
+#        Fuses GPS odometry + IMU data → /odometry/filtered
+#        The GNC node reads velocity from /odometry/filtered for its
+#        closed-loop PI speed controller.
+#
+#  How to launch (add to your launch file):
+#  ─────────────────────────────────────────
+#    from launch_ros.actions import Node as LaunchNode
+#
+#    ekf_node = LaunchNode(
+#        package='robot_localization',
+#        executable='ekf_node',
+#        name='ekf_node',
+#        parameters=[os.path.join(pkg_share, 'config', 'ekf.yaml')],
+#        remappings=[('odometry/filtered', '/odometry/filtered')]
+#    )
+#
+#    navsat_node = LaunchNode(
+#        package='robot_localization',
+#        executable='navsat_transform_node',
+#        name='navsat_transform_node',
+#        parameters=[os.path.join(pkg_share, 'config', 'ekf.yaml')],
+#        remappings=[
+#            ('imu/data',          '/wamv/sensors/imu/imu/data'),
+#            ('gps/fix',           '/wamv/sensors/gps/gps/fix'),
+#            ('odometry/filtered', '/odometry/filtered'),
+#        ]
+#    )
+#
+#  Install requirement:
+#    sudo apt install ros-humble-robot-localization
+# =============================================================================
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  1.  EKF Node
+# ─────────────────────────────────────────────────────────────────────────────
+ekf_node:
+  ros__parameters:
+
+    # Update frequency (Hz) — match or exceed your slowest sensor
+    frequency: 30.0
+
+    # If a sensor goes silent longer than this, the EKF continues on
+    # prediction alone (no hard stop). Set to 2 × slowest sensor period.
+    sensor_timeout: 0.1
+
+    # 2-D mode: ignores roll/pitch and z-axis (correct for a surface vessel)
+    two_d_mode: true
+
+    # ── Frame IDs ──────────────────────────────────────────────────────────
+    # map_frame   : global fixed frame (not used in odom-only mode)
+    # odom_frame  : local fixed frame — EKF output is expressed here
+    # base_link   : robot body frame  ← VERIFY this matches your URDF
+    # world_frame : set = odom_frame for local-only fusion (no GPS drift correction loop)
+    map_frame:       map
+    odom_frame:      odom
+    base_link_frame: wamv/wamv/base_link     # VRX WAM-V base link name
+    world_frame:     odom
+
+    # ── IMU input (sensor 0) ───────────────────────────────────────────────
+    # Topic remapped to /wamv/sensors/imu/imu/data in the launch file.
+    imu0: /wamv/sensors/imu/imu/data
+
+    # Configuration vector: which IMU fields to fuse.
+    # Order: [x,  y,  z,           ← position (don't use from IMU)
+    #         roll, pitch, YAW,    ← orientation  ← YAW = true (index 5)
+    #         vx, vy, vz,          ← linear velocity
+    #         vroll, vpitch, VYAW, ← angular velocity ← VYAW = true (index 11)
+    #         ax, ay, az]          ← linear acceleration
+    imu0_config: [false, false, false,
+                  false, false, true,
+                  false, false, false,
+                  false, false, true,
+                  false, false, false]
+
+    # false = absolute (global) heading from magnetometer
+    # true  = differential (integrate gyro only — more stable, ignores mag)
+    # Start with false for simulation; switch to true on real hardware
+    # if you have magnetic interference near the thrusters.
+    imu0_differential: false
+
+    # false = use the IMU's internal absolute reference (ENU at startup)
+    imu0_relative: false
+
+    imu0_queue_size: 10
+    imu0_remove_gravitational_acceleration: true
+
+    # ── GPS odometry input (sensor 1) ─────────────────────────────────────
+    # Produced by navsat_transform_node below → /odometry/gps
+    odom0: /odometry/gps
+
+    # Fuse X and Y position from GPS (in ENU/odom frame).
+    # Do NOT fuse orientation or velocity from GPS odometry.
+    odom0_config: [true,  true,  false,
+                   false, false, false,
+                   false, false, false,
+                   false, false, false,
+                   false, false, false]
+
+    odom0_queue_size: 10
+    odom0_differential: false
+
+    # ── Process noise covariance ───────────────────────────────────────────
+    # Diagonal elements only (15×15 state covariance).
+    # Higher value = trust the model less, react to measurements faster.
+    # Tune these if the filtered position lags or is too noisy.
+    #
+    # State order: x, y, z, roll, pitch, yaw, vx, vy, vz,
+    #              vroll, vpitch, vyaw, ax, ay, az
+    process_noise_covariance: [0.05,  0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
+                               0.0,   0.05,  0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
+                               0.0,   0.0,   0.06,  0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
+                               0.0,   0.0,   0.0,   0.03,  0.0,   0.0,   0.0,   0.0,   0.0,   0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
+                               0.0,   0.0,   0.0,   0.0,   0.03,  0.0,   0.0,   0.0,   0.0,   0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
+                               0.0,   0.0,   0.0,   0.0,   0.0,   0.06,  0.0,   0.0,   0.0,   0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
+                               0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.025, 0.0,   0.0,   0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
+                               0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.025, 0.0,   0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
+                               0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.04,  0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
+                               0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.01,   0.0,    0.0,    0.0,    0.0,    0.0,
+                               0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,    0.01,   0.0,    0.0,    0.0,    0.0,
+                               0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,    0.0,    0.02,   0.0,    0.0,    0.0,
+                               0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,    0.0,    0.0,    0.01,   0.0,    0.0,
+                               0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,    0.0,    0.0,    0.0,    0.01,   0.0,
+                               0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,    0.0,    0.0,    0.0,    0.0,    0.015]
+
+    # ── Initial estimate covariance ────────────────────────────────────────
+    # How uncertain is the filter at startup?  Start high; it will converge.
+    initial_estimate_covariance: [1e-9, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,   0.0,   0.0,   0.0,   0.0,   0.0,
+                                  0.0,  1e-9, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,   0.0,   0.0,   0.0,   0.0,   0.0,
+                                  0.0,  0.0,  1e-9, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,   0.0,   0.0,   0.0,   0.0,   0.0,
+                                  0.0,  0.0,  0.0,  1e-9, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,   0.0,   0.0,   0.0,   0.0,   0.0,
+                                  0.0,  0.0,  0.0,  0.0,  1e-9, 0.0,  0.0,  0.0,  0.0,  0.0,   0.0,   0.0,   0.0,   0.0,   0.0,
+                                  0.0,  0.0,  0.0,  0.0,  0.0,  1e-9, 0.0,  0.0,  0.0,  0.0,   0.0,   0.0,   0.0,   0.0,   0.0,
+                                  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  1e-9, 0.0,  0.0,  0.0,   0.0,   0.0,   0.0,   0.0,   0.0,
+                                  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  1e-9, 0.0,  0.0,   0.0,   0.0,   0.0,   0.0,   0.0,
+                                  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  1e-9, 0.0,   0.0,   0.0,   0.0,   0.0,   0.0,
+                                  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  1e-9,  0.0,   0.0,   0.0,   0.0,   0.0,
+                                  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,   1e-9,  0.0,   0.0,   0.0,   0.0,
+                                  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,   0.0,   1e-9,  0.0,   0.0,   0.0,
+                                  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,   0.0,   0.0,   1e-9,  0.0,   0.0,
+                                  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,   0.0,   0.0,   0.0,   1e-9,  0.0,
+                                  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,   0.0,   0.0,   0.0,   0.0,   1e-9]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  2.  navsat_transform_node
+# ─────────────────────────────────────────────────────────────────────────────
+navsat_transform_node:
+  ros__parameters:
+
+    # Must match ekf_node frequency
+    frequency: 30.0
+
+    # How long to wait for a GPS + IMU fix before setting the datum
+    delay: 3.0
+
+    # If true: waits for a valid /odometry/filtered before publishing.
+    # Set false so the transform starts immediately from first GPS fix,
+    # which matches how we set /usv/origin in the GNC node.
+    wait_for_datum: false
+
+    # Zero altitude for surface vessel
+    zero_altitude: true
+
+    # Use the EKF odometry broadcast as the robot's current pose for the
+    # transform (enables the feedback loop for GPS drift correction).
+    broadcast_utm_transform: false
+    broadcast_utm_transform_as_parent_frame: false
+
+    # Publish TF from utm → odom ?  Keep false unless you need full nav2 stack.
+    publish_filtered_gps: false
+
+    # Use the yaw from the IMU (via EKF) as the heading for GPS conversion.
+    # IMPORTANT: set true so GPS north is aligned with IMU heading.
+    use_odometry_yaw: false   # false = use ENU convention (magnetometer north)
+
+    # Magnetic declination at your location (radians).
+    # For Sydney area (VRX default): approximately +0.19 rad (≈ 11° E)
+    # Find yours at: https://www.ngdc.noaa.gov/geomag/calculators/magcalc.shtml
+    # For simulation you can leave at 0.0
+    magnetic_declination_radians: 0.0
+
+    # ENU (East-North-Up) is the ROS convention — keep true
+    yaw_offset: 0.0
+
+
+# =============================================================================
+#  Tuning Guide — Quick Reference
+# =============================================================================
+#
+#  SYMPTOM: Filtered position lags real GPS by >0.5 m
+#  FIX    : Reduce odom0_config rows 1-2 diagonal in process_noise_covariance
+#           OR increase measurement covariance in your IMU's message
+#
+#  SYMPTOM: Filtered position is noisy / jumpy
+#  FIX    : Increase odom0_config diagonal process_noise values (rows x, y)
+#
+#  SYMPTOM: Heading drifts slowly over time
+#  FIX    : Set imu0_differential: true  to rely on gyro integration only
+#           AND calibrate magnetometer before every outdoor session
+#
+#  SYMPTOM: EKF velocity reading seems wrong / delayed
+#  FIX    : Check two_d_mode is true.  Confirm base_link_frame matches URDF.
+#           Increase frequency to 50 Hz if IMU is publishing at 100 Hz.
+#
+#  SYMPTOM: navsat_transform_node does not publish /odometry/gps
+#  FIX    : Ensure wait_for_datum is false and GPS has a valid fix (not NaN).
+#           Echo: ros2 topic echo /wamv/sensors/gps/gps/fix --once
+# =============================================================================

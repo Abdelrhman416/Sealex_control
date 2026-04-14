@@ -80,6 +80,7 @@ RC_TIMEOUT_SEC  = 0.5           # RC override auto-clears after this silence
 SLOW_ZONE_M      = 8.0                  # distance at which deceleration begins
 MIN_SPEED        = 0.3                  # minimum forward speed inside slow zone
 ALIGN_THRESHOLD  = math.radians(40)    # heading error → cut speed
+LOS_DELTA_M      = 8.0                # LOS lookahead distance (metres)
 
 # ===========================================================================
 # ─────────────────────────────────────────────────────────────────────────────
@@ -295,6 +296,8 @@ class USVGNCNode(Node):
         self.target_x       = None
         self.target_y       = None
         self.mission_active = False
+        self.wp_prev_x      = None
+        self.wp_prev_y      = None
 
         # ── [NEW] E-STOP state (dual: SW + HW) ────────────────────────────
         self.sw_estop_active = False   # triggered by /usv/estop
@@ -426,6 +429,30 @@ class USVGNCNode(Node):
             # Open-loop: reset integrator so there's no bump on EKF reconnect
             self.v_integral = 0.0
             return clamp(v_command * OPEN_LOOP_GAIN, 0.0, MAX_THRUSTER_N)
+        
+    def _los_heading(self) -> float:
+        """Compute LOS desired heading from the current path segment."""
+        # Safety check: If we have no target, just maintain current heading
+        if self.target_x is None or self.target_y is None:
+            return self.psi
+        
+        # Fallback: no path segment yet
+        if self.wp_prev_x is None or self.wp_prev_y is None:
+            return math.atan2(self.target_y - self.y,
+                              self.target_x - self.x)
+
+        # Path angle (direction the segment is pointing)
+        pi_p = math.atan2(self.target_y - self.wp_prev_y,
+                          self.target_x - self.wp_prev_x)
+
+        # Crosstrack error — perpendicular signed distance from the path
+        dx   = self.x - self.wp_prev_x
+        dy   = self.y - self.wp_prev_y
+        e_ct = -dx * math.sin(pi_p) + dy * math.cos(pi_p)
+
+        # LOS correction: steer toward a point LOS_DELTA_M ahead on the path
+        return pi_p + math.atan2(-e_ct, LOS_DELTA_M)
+
 
     def _pid_heading(self, psi_desired: float) -> tuple[float, float]:
         """
@@ -649,6 +676,9 @@ class USVGNCNode(Node):
         if not self.origin_set or self.origin_lat is None or self.origin_lon is None:
             self.get_logger().warn('[TARGET] No origin — publish to /usv/origin first.')
             return
+        self.wp_prev_x = self.x
+        self.wp_prev_y = self.y
+
         self.target_x, self.target_y = gps_to_xy(
             msg.latitude, msg.longitude,
             self.origin_lat, self.origin_lon)
@@ -747,10 +777,8 @@ class USVGNCNode(Node):
             self.v_integral     = 0.0
             return
 
-        # Desired heading and error (wrapped to [-π, π])
-        psi_desired = math.atan2(
-            self.target_y - self.y,
-            self.target_x - self.x)
+        ## [L4] LOS desired heading
+        psi_desired = self._los_heading()
         
         # PID heading controller
         omega, e = self._pid_heading(psi_desired)

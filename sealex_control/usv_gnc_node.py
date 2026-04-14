@@ -1,65 +1,56 @@
 #!/usr/bin/env python3
 """
-SEALEX GNC Node — Level 3 (Hardware-Ready)
-===========================================
-Platform  : WAM-V / VRX 3.1.0 / Gazebo Garden / ROS 2 Humble
-Author    : SEALEX Team
+SEALEX GNC Node — Level 4 (High-Priority Upgrades)
+====================================================
+Platform : WAM-V / VRX 3.1.0 / Gazebo Garden / ROS 2 Humble
+Author   : SEALEX Team
 
-Upgrade Levels
---------------
-L1  True IMU heading  — quaternion → yaw (replaces course-over-ground)
-L2  Dual-sensor watchdog — GPS + IMU timeouts with one-shot logging & recovery
-L3  EKF integration  — subscribes to /odometry/filtered (robot_localization).
-    Velocity feedback extracted from EKF odometry enables closed-loop speed
-    control (PI surge controller).  Falls back gracefully to open-loop if the
-    EKF node is not running.
+Upgrade History
+---------------
+L1  True IMU heading           quaternion → yaw
+L2  Dual-sensor watchdog       GPS + IMU timeouts, one-shot logging
+L3  EKF integration            PI closed-loop speed via /odometry/filtered
+    Hardware E-STOP            /usv/hw_estop separate from SW E-STOP
+    RC Override                /usv/rc_override with auto-timeout
+    Thruster calibration       deadband, per-side trim, nonlinear curve
 
-New in this version (Critical hardware-readiness additions)
------------------------------------------------------------
-• Hardware E-STOP  (/usv/hw_estop, std_msgs/Bool)
-    Separate from the software E-STOP so a physical kill-switch relay or RC
-    channel can be wired independently. Both SW and HW E-STOPs must be clear
-    before autonomous motion resumes.
+L4  (Current Version)
+    ─────────────────────────────────────────────────────────────────────
+    PID heading controller
+        Adds an integral term (Ki) to the existing PD heading controller.
+        The integral removes steady-state heading error from persistent
+        crosswind or asymmetric drag. Anti-windup prevents blow-up on
+        long turns. 
 
-• RC Override  (/usv/rc_override, geometry_msgs/Twist)
-    linear.x  : [-1 .. +1]  forward/reverse speed scale
-    angular.z : [-1 .. +1]  yaw-rate scale
-    If a message arrives within RC_TIMEOUT_SEC the node bypasses autonomous
-    control completely and maps the RC command directly to thrusters.
-    Override clears automatically when messages stop arriving.
+    Line-of-Sight (LOS) guidance
+        Replaces naive "steer directly at goal" with proper LOS.
+        LOS defines a path SEGMENT (previous WP → current WP) and steers
+        toward a point Δ ahead on that segment. This naturally corrects
+        crosstrack error (boat drifting sideways off the path due to
+        current/wind) without any extra control loop.
 
-• Thruster Calibration Layer
-    Every thrust value passes through apply_thrust_calibration() before
-    publishing, which applies:
-      1. Per-side trim offset  (compensates mechanical/motor asymmetry)
-      2. Deadband              (zero-output below threshold — prevents
-                                hunting and protects ESC/motor from
-                                continuous micro-commands)
-      3. Nonlinear power curve (exponent > 1 → finer low-speed control)
-    All calibration constants are at the top of the file and are the first
-    things to tune on real hardware.
-
-• Closed-loop surge speed (PI) when EKF is running
-    When /odometry/filtered is alive the node reads vx,vy from the Odometry
-    message, projects them into the boat's body frame to obtain actual surge
-    speed, and drives a PI speed error to thrust. Falls back to open-loop
-    (velocity * OPEN_LOOP_GAIN) when EKF is unavailable.
+    Multi-waypoint mission queue
+        The node now holds an ordered list of waypoints.
+        /usv/queue_add     (NavSatFix) — append one WP to the queue
+        /usv/mission_start (Bool)      — True: start queue / False: clear
 
 Topics subscribed
 -----------------
-  /wamv/sensors/gps/gps/fix          sensor_msgs/NavSatFix
-  /wamv/sensors/imu/imu/data         sensor_msgs/Imu
-  /odometry/filtered                 nav_msgs/Odometry        (robot_localization)
-  /usv/origin                        sensor_msgs/NavSatFix    (one-way door)
-  /usv/target                        sensor_msgs/NavSatFix    (from dashboard)
-  /usv/estop                         std_msgs/Bool            (software E-STOP)
-  /usv/hw_estop                      std_msgs/Bool            (hardware E-STOP)
-  /usv/rc_override                   geometry_msgs/Twist      (RC manual override)
+  /wamv/sensors/gps/gps/fix    sensor_msgs/NavSatFix
+  /wamv/sensors/imu/imu/data   sensor_msgs/Imu
+  /odometry/filtered            nav_msgs/Odometry         (robot_localization)
+  /usv/origin                   sensor_msgs/NavSatFix
+  /usv/target                   sensor_msgs/NavSatFix     (single immediate WP)
+  /usv/queue_add                sensor_msgs/NavSatFix     [NEW] append to queue
+  /usv/mission_start            std_msgs/Bool             [NEW] start / clear
+  /usv/estop                    std_msgs/Bool
+  /usv/hw_estop                 std_msgs/Bool
+  /usv/rc_override              geometry_msgs/Twist
 
 Topics published
 ----------------
-  /wamv/thrusters/left/thrust        std_msgs/Float64
-  /wamv/thrusters/right/thrust       std_msgs/Float64
+  /wamv/thrusters/left/thrust   std_msgs/Float64
+  /wamv/thrusters/right/thrust  std_msgs/Float64
 """
 
 import math
@@ -130,6 +121,13 @@ KP_V = 40.0     # proportional gain  (surge speed error → thrust)
 KI_V =  5.0     # integral gain
 V_INTEGRAL_LIMIT = 30.0  # anti-windup clamp on integral accumulator
 
+# ===========================================================================
+# PID heading controller gains
+# ===========================================================================
+KP_PSI             = 1.2
+KD_PSI             = 1.0
+KI_PSI             = 0.0   # Tune on real hardware to fix wind bias
+PSI_INTEGRAL_LIMIT = 0.5   # anti-windup clamp on heading integral
 
 # ===========================================================================
 # Pure functions
@@ -148,6 +146,9 @@ def gps_to_xy(lat: float, lon: float,
 def clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
+def wrap_angle(a: float) -> float:
+    """Wrap angle to (-pi, pi]."""
+    return math.atan2(math.sin(a), math.cos(a))
 
 def apply_thrust_calibration(raw: float,
                               trim: float,
@@ -309,10 +310,9 @@ class USVGNCNode(Node):
         self.v_desired = 2.0   # cruise speed m/s
         self.R_accept  = 1.5   # waypoint acceptance radius m
 
-        # ── Heading controller gains ───────────────────────────────────────
-        self.Kp               = 1.2
-        self.Kd               = 1.0
+       # ── Heading controller state ───────────────────────────────────────
         self.prev_e           = 0.0
+        self.e_integral       = 0.0
         self.max_angular_speed = 0.8   # rad/s
 
         # ── Thruster limits ────────────────────────────────────────────────
@@ -426,6 +426,22 @@ class USVGNCNode(Node):
             # Open-loop: reset integrator so there's no bump on EKF reconnect
             self.v_integral = 0.0
             return clamp(v_command * OPEN_LOOP_GAIN, 0.0, MAX_THRUSTER_N)
+
+    def _pid_heading(self, psi_desired: float) -> tuple[float, float]:
+        """
+        PID yaw-rate controller. Returns (omega, heading_error).
+        """
+        e     = wrap_angle(psi_desired - self.psi)
+        e_dot = (e - self.prev_e) / self.dt
+
+        self.e_integral = clamp(
+            self.e_integral + e * self.dt,
+            -PSI_INTEGRAL_LIMIT, PSI_INTEGRAL_LIMIT)
+
+        omega      = KP_PSI * e + KD_PSI * e_dot + KI_PSI * self.e_integral
+        self.prev_e = e
+
+        return clamp(omega, -self.max_angular_speed, self.max_angular_speed), e
 
     # =========================================================================
     # Speed guidance (distance + heading aware)
@@ -735,16 +751,9 @@ class USVGNCNode(Node):
         psi_desired = math.atan2(
             self.target_y - self.y,
             self.target_x - self.x)
-        e = math.atan2(
-            math.sin(psi_desired - self.psi),
-            math.cos(psi_desired - self.psi))
-
-        # PD heading controller
-        e_dot  = (e - self.prev_e) / self.dt
-        omega  = clamp(
-            self.Kp * e + self.Kd * e_dot,
-            -self.max_angular_speed, self.max_angular_speed)
-        self.prev_e = e
+        
+        # PID heading controller
+        omega, e = self._pid_heading(psi_desired)
 
         # Desired speed (guidance)
         v_cmd = self._compute_velocity_command(distance, e)

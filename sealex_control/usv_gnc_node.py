@@ -80,7 +80,7 @@ RC_TIMEOUT_SEC  = 0.5           # RC override auto-clears after this silence
 SLOW_ZONE_M      = 8.0                  # distance at which deceleration begins
 MIN_SPEED        = 0.3                  # minimum forward speed inside slow zone
 ALIGN_THRESHOLD  = math.radians(40)    # heading error → cut speed
-LOS_DELTA_M      = 3.0                # LOS lookahead distance (metres)
+LOS_DELTA_M      = 8.0                # LOS lookahead distance (metres)
 
 # ===========================================================================
 # ─────────────────────────────────────────────────────────────────────────────
@@ -120,7 +120,7 @@ OPEN_LOOP_GAIN = 45.0   # maps m/s command → thrust units  (empirical)
 # ===========================================================================
 KP_V = 40.0     # proportional gain  (surge speed error → thrust)
 KI_V =  5.0     # integral gain
-V_INTEGRAL_LIMIT = 30.0  # anti-windup clamp on integral accumulator
+V_INTEGRAL_LIMIT = 3.0  # anti-windup clamp on integral accumulator
 
 # ===========================================================================
 # PID heading controller gains
@@ -336,7 +336,7 @@ class USVGNCNode(Node):
         self.get_logger().info(
             '\n'
             '╔══════════════════════════════════════════╗\n'
-            '║   SEALEX GNC Node  —  Level 3 ACTIVE     ║\n'
+            '║   SEALEX GNC Node  —  Level 4 ACTIVE     ║\n'
             '║   EKF: waiting for /odometry/filtered    ║\n'
             '║   Publish /usv/origin to unlock          ║\n'
             '╚══════════════════════════════════════════╝'
@@ -421,20 +421,36 @@ class USVGNCNode(Node):
         The returned value is in the same units as OPEN_LOOP_GAIN output
         and is passed to the differential-thrust mixing stage.
         """
+
+        # 👇 THE BUG FIX: Instant kill-switch for Pivot Turns 👇
+        # If guidance demands 0.0 speed, instantly erase the integrator 
+        # memory and cut forward thrust so the boat can spin in place.
+        if v_command == 0.0:
+            self.v_integral = 0.0
+            return 0.0
+        
         if self.ekf_alive:
             # Project world-frame velocity onto boat's forward axis (body surge)
             v_actual = (self.ekf_vx_world * math.cos(self.psi) +
                         self.ekf_vy_world * math.sin(self.psi))
-
+    
             v_error = v_command - v_actual
 
             # Integrate with anti-windup
-            self.v_integral = clamp(
-                self.v_integral + v_error * self.dt,
-                -V_INTEGRAL_LIMIT, V_INTEGRAL_LIMIT)
+            if self.ekf_alive:
+               v_actual = (self.ekf_vx_world * math.cos(self.psi) +
+                           self.ekf_vy_world * math.sin(self.psi))
+               v_error = v_command - v_actual
 
-            thrust = KP_V * v_error + KI_V * self.v_integral
-            return clamp(thrust, 0.0, MAX_THRUSTER_N)
+               thrust = KP_V * v_error + KI_V * self.v_integral
+               output = clamp(thrust, 0.0, MAX_THRUSTER_N)
+
+               # Anti-windup: only integrate when output is NOT saturated
+               if output < MAX_THRUSTER_N:
+                   self.v_integral = clamp(
+                       self.v_integral + v_error * self.dt,
+                       -V_INTEGRAL_LIMIT, V_INTEGRAL_LIMIT)
+            return output
         else:
             # Open-loop: reset integrator so there's no bump on EKF reconnect
             self.v_integral = 0.0
@@ -445,6 +461,12 @@ class USVGNCNode(Node):
         # Safety check: If we have no target, just maintain current heading
         if self.target_x is None or self.target_y is None:
             return self.psi
+        
+        # When close to the waypoint, switch to direct bearing.
+        # LOS geometry breaks down when distance < lookahead distance.
+        dist = math.hypot(self.target_x - self.x, self.target_y - self.y)
+        if dist < LOS_DELTA_M or self.wp_prev_x is None or self.wp_prev_y is None:
+            return math.atan2(self.target_y - self.y, self.target_x - self.x)
         
         # Fallback: no path segment yet
         if self.wp_prev_x is None or self.wp_prev_y is None:

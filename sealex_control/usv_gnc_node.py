@@ -79,7 +79,8 @@ RC_TIMEOUT_SEC  = 0.5           # RC override auto-clears after this silence
 # ===========================================================================
 SLOW_ZONE_M      = 8.0                  # distance at which deceleration begins
 MIN_SPEED        = 0.3                  # minimum forward speed inside slow zone
-ALIGN_THRESHOLD  = math.radians(40)    # heading error → cut speed
+ALIGN_THRESHOLD  = math.radians(8)    # heading error → cut speed
+ALIGN_HYSTERESIS = math.radians(20)   # cut speed again if error exceeds this
 LOS_DELTA_M      = 8.0                # LOS lookahead distance (metres)
 
 # ===========================================================================
@@ -308,6 +309,7 @@ class USVGNCNode(Node):
         self.wp_prev_x      = None
         self.wp_prev_y      = None
         self.mission_active = False
+        self._is_aligned = False   # hysteresis flag — False = spinning to align, True = aligned and cruising        
 
         # ── [NEW] E-STOP state (dual: SW + HW) ────────────────────────────
         self.sw_estop_active = False   # triggered by /usv/estop
@@ -508,36 +510,35 @@ class USVGNCNode(Node):
 
     def _compute_velocity_command(self, distance: float,
                                    heading_error: float) -> float:
-        """
-        Return the desired surge speed based on proximity and alignment.
-
-        CRUISE zone  (dist ≥ SLOW_ZONE_M) : full v_desired
-        SLOW zone    (dist <  SLOW_ZONE_M) : linear ramp MIN_SPEED → v_desired
-        ALIGN penalty (|e| > ALIGN_THRESHOLD): cuts speed ≤ 85%
-          so the boat turns in place instead of arcing widely.
-        """
         abs_e = abs(heading_error)
-
-        # 1. THE PIVOT TURN LOGIC (Stop and Spin)
-        # If we are facing more than 40 degrees away from the target line,
-        # cut forward speed to ZERO. The boat will only use omega (yaw) to spin.
-        if abs_e > ALIGN_THRESHOLD:
-            return 0.0
-
-        # 2. NORMAL CRUISE / SLOW ZONE LOGIC
-        # Only runs if the boat is properly pointed at the target.
+    
+        # Hysteresis alignment state machine:
+        # - When _is_aligned is False: spin in place until error < ALIGN_THRESHOLD
+        # - Once moving: keep moving until error > ALIGN_HYSTERESIS
+        # This prevents the orbit caused by starting forward motion too early.
+        if not self._is_aligned:
+            if abs_e > ALIGN_THRESHOLD:
+                return 0.0          # still spinning to align — no forward motion
+            else:
+                self._is_aligned = True   # locked on — start moving
+    
+        else:  # currently moving forward
+            if abs_e > ALIGN_HYSTERESIS:
+                self._is_aligned = False  # lost alignment — stop and re-align
+                return 0.0
+    
+        # Forward speed profile (only reached when aligned)
         if distance >= SLOW_ZONE_M:
             v = self.v_desired
         else:
             t = (distance - self.R_accept) / (SLOW_ZONE_M - self.R_accept)
             v = MIN_SPEED + clamp(t, 0.0, 1.0) * (self.v_desired - MIN_SPEED)
-
-        # 3. GENTLE CORRECTION
-        # Slightly slow down for minor heading adjustments (< 40 degrees)
-        if abs_e > math.radians(15):
-            penalty = 1.0 - 0.5 * (abs_e - math.radians(15)) / (ALIGN_THRESHOLD - math.radians(15))
-            v *= clamp(penalty, 0.5, 1.0)
-
+    
+        # Gentle slow-down for small residual heading error (5°–20°)
+        if abs_e > math.radians(5):
+            penalty = 1.0 - 0.3 * (abs_e - math.radians(5)) / (ALIGN_HYSTERESIS - math.radians(5))
+            v *= clamp(penalty, 0.7, 1.0)
+    
         return clamp(v, 0.0, self.max_linear_speed)
 
     # =========================================================================
@@ -567,6 +568,7 @@ class USVGNCNode(Node):
         self.prev_e     = 0.0
         self.e_integral = 0.0
         self.v_integral = 0.0
+        self._is_aligned = False
 
         self.get_logger().info(
             f'[QUEUE] Next WP: X={self.target_x:.2f} Y={self.target_y:.2f}  '
@@ -765,6 +767,7 @@ class USVGNCNode(Node):
         self.prev_e         = 0.0
         self.e_integral     = 0.0
         self.v_integral     = 0.0
+        self._is_aligned = False
         
         self.get_logger().info(
             f'[TARGET] Immediate WP: X={self.target_x:.3f} Y={self.target_y:.3f}')
@@ -811,6 +814,7 @@ class USVGNCNode(Node):
         self.prev_e         = 0.0
         self.e_integral     = 0.0
         self.v_integral     = 0.0
+        self._is_aligned = False
         
         self.get_logger().info(
             f'[QUEUE] Mission STARTED — WP1: X={self.target_x:.2f} Y={self.target_y:.2f}  '

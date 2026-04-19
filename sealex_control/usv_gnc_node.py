@@ -73,6 +73,7 @@ GPS_TIMEOUT_SEC = 1.0
 IMU_TIMEOUT_SEC = 0.5
 EKF_TIMEOUT_SEC = 2.0           # if EKF goes silent, revert to open-loop speed
 RC_TIMEOUT_SEC  = 0.5           # RC override auto-clears after this silence
+HEARTBEAT_TIMEOUT = 600.0       # 10 minutes failsafe (seconds)
 
 # ===========================================================================
 # Slow-zone / alignment guidance parameters
@@ -232,6 +233,7 @@ class USVGNCNode(Node):
             Bool, '/usv/mission_start',
             self.mission_start_callback, 10)
         
+        
         # Dynamic target from web dashboard
         self.target_sub = self.create_subscription(
             NavSatFix, '/usv/target',
@@ -261,6 +263,14 @@ class USVGNCNode(Node):
         self.rc_sub = self.create_subscription(
             Twist, '/usv/rc_override',
             self.rc_callback, 10)
+        
+        # ── [L5] Failsafe & Parking state ──────────────────────────────────
+        self.park_active        = False
+        self.last_heartbeat     = self.get_clock().now()
+        self.failsafe_triggered = False
+
+        self.create_subscription(Bool, '/usv/park', self.park_callback, 10)
+        self.create_subscription(Bool, '/usv/heartbeat', self.heartbeat_callback, 10)
 
         # ── Publishers ─────────────────────────────────────────────────────
         self.left_pub  = self.create_publisher(
@@ -511,7 +521,7 @@ class USVGNCNode(Node):
     def _compute_velocity_command(self, distance: float,
                                    heading_error: float) -> float:
         abs_e = abs(heading_error)
-    
+
         # Hysteresis alignment state machine:
         # - When _is_aligned is False: spin in place until error < ALIGN_THRESHOLD
         # - Once moving: keep moving until error > ALIGN_HYSTERESIS
@@ -521,24 +531,24 @@ class USVGNCNode(Node):
                 return 0.0          # still spinning to align — no forward motion
             else:
                 self._is_aligned = True   # locked on — start moving
-    
+
         else:  # currently moving forward
             if abs_e > ALIGN_HYSTERESIS:
                 self._is_aligned = False  # lost alignment — stop and re-align
                 return 0.0
-    
+
         # Forward speed profile (only reached when aligned)
         if distance >= SLOW_ZONE_M:
             v = self.v_desired
         else:
             t = (distance - self.R_accept) / (SLOW_ZONE_M - self.R_accept)
             v = MIN_SPEED + clamp(t, 0.0, 1.0) * (self.v_desired - MIN_SPEED)
-    
+
         # Gentle slow-down for small residual heading error (5°–20°)
         if abs_e > math.radians(5):
             penalty = 1.0 - 0.3 * (abs_e - math.radians(5)) / (ALIGN_HYSTERESIS - math.radians(5))
             v *= clamp(penalty, 0.7, 1.0)
-    
+
         return clamp(v, 0.0, self.max_linear_speed)
 
     # =========================================================================
@@ -819,12 +829,36 @@ class USVGNCNode(Node):
         self.get_logger().info(
             f'[QUEUE] Mission STARTED — WP1: X={self.target_x:.2f} Y={self.target_y:.2f}  '
             f'({len(self.waypoint_queue)} more in queue)')
+        
+
+    # =========================================================================
+    # Callbacks — Failsafe & Parking
+    # =========================================================================
+
+    def park_callback(self, msg: Bool) -> None:
+        self.park_active = msg.data
+        if self.park_active:
+            self.get_logger().warn('\n[PARK] Parking Mode ENGAGED — Motors on standby.\n')
+            self.stop_boat()
+        else:
+            self.get_logger().info('\n[PARK] Parking Mode CLEARED — Resuming mission.\n')
+
+    def heartbeat_callback(self, msg: Bool) -> None:
+        self.last_heartbeat = self.get_clock().now()
+        if self.failsafe_triggered:
+            self.get_logger().info('[FAILSAFE] Connection restored!')
+            self.failsafe_triggered = False
 
     # =========================================================================
     # Main control loop  (10 Hz)
     # =========================================================================
 
     def control_loop(self) -> None:
+
+        # ── Priority 0: Park Mode ──────────────────────────────────────────
+        if self.park_active:
+            self.stop_boat()
+            return
 
         # ── Priority 1: ANY E-STOP ─────────────────────────────────────────
         if self.any_estop:
@@ -836,7 +870,23 @@ class USVGNCNode(Node):
             self.stop_boat()
             return
 
-        # ── Priority 2: RC Override ────────────────────────────────────────
+        # ── Priority 2: 15-Minute Failsafe (Heartbeat Check) ───────────────
+        if self._sensor_age(self.last_heartbeat) > 600.0:  # 600s = 10 mins
+            if not self.failsafe_triggered:
+                self.get_logger().error(
+                    '\n!!! FAILSAFE: 10 MINUTE CONNECTION LOST !!!\n'
+                    'Clearing queue and returning to Origin immediately.\n')
+                self.failsafe_triggered = True
+                self.waypoint_queue.clear()
+                if self.origin_set:
+                    # In our ENU map, the locked origin is exactly (0.0, 0.0)
+                    self.target_x, self.target_y = 0.0, 0.0
+                    self.mission_active = True
+                else:
+                    self.stop_boat()
+            # Let it continue to drive to 0,0 or idle if no origin.
+
+        # ── Priority 3: RC Override ────────────────────────────────────────
         if self.rc_alive:
             if not self.rc_override_active:
                 self.rc_override_active = True
@@ -851,14 +901,14 @@ class USVGNCNode(Node):
                     'Autonomous control restored.')
             # Fall through to autonomous ↓
 
-        # ── Priority 3: Origin lock ────────────────────────────────────────
+        # ── Priority 4: Origin lock ────────────────────────────────────────
         if not self.origin_set:
             self.get_logger().warn(
                 'Waiting for origin — publish NavSatFix to /usv/origin',
                 throttle_duration_sec=5.0)
             return
 
-        # ── Priority 4: Sensor readiness ──────────────────────────────────
+        # ── Priority 5: Sensor readiness ──────────────────────────────────
         if not self.gps_ready or not self.imu_ready:
             self.get_logger().warn(
                 f'Waiting for sensors — '
@@ -867,7 +917,7 @@ class USVGNCNode(Node):
                 throttle_duration_sec=2.0)
             return
 
-        # ── Priority 5: Sensor watchdog ────────────────────────────────────
+        # ── Priority 6: Sensor watchdog ────────────────────────────────────
         if not self._sensors_healthy():
             self.stop_boat()
             return

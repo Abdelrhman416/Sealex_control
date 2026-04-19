@@ -71,7 +71,7 @@ EARTH_RADIUS = 6_371_000.0      # metres
 # ===========================================================================
 GPS_TIMEOUT_SEC = 1.0
 IMU_TIMEOUT_SEC = 0.5
-EKF_TIMEOUT_SEC = 0.5           # if EKF goes silent, revert to open-loop speed
+EKF_TIMEOUT_SEC = 2.0           # if EKF goes silent, revert to open-loop speed
 RC_TIMEOUT_SEC  = 0.5           # RC override auto-clears after this silence
 
 # ===========================================================================
@@ -80,7 +80,7 @@ RC_TIMEOUT_SEC  = 0.5           # RC override auto-clears after this silence
 SLOW_ZONE_M      = 8.0                  # distance at which deceleration begins
 MIN_SPEED        = 0.3                  # minimum forward speed inside slow zone
 ALIGN_THRESHOLD  = math.radians(40)    # heading error → cut speed
-LOS_DELTA_M      = 8.0                # LOS lookahead distance (metres)
+LOS_DELTA_M      = 3.0                # LOS lookahead distance (metres)
 
 # ===========================================================================
 # ─────────────────────────────────────────────────────────────────────────────
@@ -494,16 +494,27 @@ class USVGNCNode(Node):
         ALIGN penalty (|e| > ALIGN_THRESHOLD): cuts speed ≤ 85%
           so the boat turns in place instead of arcing widely.
         """
+        abs_e = abs(heading_error)
+
+        # 1. THE PIVOT TURN LOGIC (Stop and Spin)
+        # If we are facing more than 40 degrees away from the target line,
+        # cut forward speed to ZERO. The boat will only use omega (yaw) to spin.
+        if abs_e > ALIGN_THRESHOLD:
+            return 0.0
+
+        # 2. NORMAL CRUISE / SLOW ZONE LOGIC
+        # Only runs if the boat is properly pointed at the target.
         if distance >= SLOW_ZONE_M:
             v = self.v_desired
         else:
             t = (distance - self.R_accept) / (SLOW_ZONE_M - self.R_accept)
             v = MIN_SPEED + clamp(t, 0.0, 1.0) * (self.v_desired - MIN_SPEED)
 
-        abs_e = abs(heading_error)
-        if abs_e > ALIGN_THRESHOLD:
-            penalty = 1.0 - 0.85 * (abs_e - ALIGN_THRESHOLD) / (math.pi - ALIGN_THRESHOLD)
-            v *= clamp(penalty, 0.15, 1.0)
+        # 3. GENTLE CORRECTION
+        # Slightly slow down for minor heading adjustments (< 40 degrees)
+        if abs_e > math.radians(15):
+            penalty = 1.0 - 0.5 * (abs_e - math.radians(15)) / (ALIGN_THRESHOLD - math.radians(15))
+            v *= clamp(penalty, 0.5, 1.0)
 
         return clamp(v, 0.0, self.max_linear_speed)
 

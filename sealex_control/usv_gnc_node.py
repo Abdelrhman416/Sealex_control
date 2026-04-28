@@ -71,7 +71,7 @@ EARTH_RADIUS = 6_371_000.0      # metres
 # ===========================================================================
 GPS_TIMEOUT_SEC = 1.0
 IMU_TIMEOUT_SEC = 0.5
-EKF_TIMEOUT_SEC = 2.0           # if EKF goes silent, revert to open-loop speed
+EKF_TIMEOUT_SEC = 0.5           # if EKF goes silent, revert to open-loop speed
 RC_TIMEOUT_SEC  = 0.5           # RC override auto-clears after this silence
 HEARTBEAT_TIMEOUT = 600.0       # 10 minutes failsafe (seconds)
 
@@ -203,12 +203,12 @@ class USVGNCNode(Node):
 
         # Raw GPS — always subscribed for position (and as EKF fallback)
         self.gps_sub = self.create_subscription(
-            NavSatFix, '/wamv/sensors/gps/gps/fix',
+            NavSatFix, '/esp/gps/fix',
             self.gps_callback, 10)
 
         # Raw IMU — always subscribed for heading
         self.imu_sub = self.create_subscription(
-            Imu, '/wamv/sensors/imu/imu/data',
+            Imu, '/esp/imu/data',
             self.imu_callback, 10)
 
         # ── [L3] EKF filtered odometry ─────────────────────────────────────

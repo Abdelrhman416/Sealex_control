@@ -66,7 +66,7 @@ from sensor_msgs.msg import Imu
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-IMU_TOPIC          = '/wamv/sensors/imu/imu/data'
+IMU_TOPIC          = '/esp/imu/data'
 DEFAULT_DURATION   = 20.0    # seconds to collect data
 
 # Pass/fail thresholds
@@ -302,7 +302,9 @@ def main(args=None):
     # Allow duration override via ROS parameter
     node = IMUCalibrationChecker()
     node.declare_parameter('duration_sec', DEFAULT_DURATION)
-    node.duration_sec = node.get_parameter('duration_sec').value
+    duration_value = node.get_parameter('duration_sec').value
+    if duration_value is not None:
+        node.duration_sec = float(duration_value)
 
     try:
         while rclpy.ok() and not node.is_done():

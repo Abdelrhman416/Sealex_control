@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-SEALEX GNC Node — Level 4 (High-Priority Upgrades)
+SEALEX GNC Node — Level 5 (Hardware Deployment)
 ====================================================
-Platform : WAM-V / VRX 3.1.0 / Gazebo Garden / ROS 2 Humble
+Platform : Real Hardware (Raspberry Pi 4 / ESP32) / ROS 2 Humble
 Author   : SEALEX Team
 
 Upgrade History
@@ -13,44 +13,33 @@ L3  EKF integration            PI closed-loop speed via /odometry/filtered
     Hardware E-STOP            /usv/hw_estop separate from SW E-STOP
     RC Override                /usv/rc_override with auto-timeout
     Thruster calibration       deadband, per-side trim, nonlinear curve
-
-L4  (Current Version)
+L4  PID heading controller     LOS Guidance, Multi-WP Queue
+L5  (Current Version)
     ─────────────────────────────────────────────────────────────────────
-    PID heading controller
-        Adds an integral term (Ki) to the existing PD heading controller.
-        The integral removes steady-state heading error from persistent
-        crosswind or asymmetric drag. Anti-windup prevents blow-up on
-        long turns. 
-
-    Line-of-Sight (LOS) guidance
-        Replaces naive "steer directly at goal" with proper LOS.
-        LOS defines a path SEGMENT (previous WP → current WP) and steers
-        toward a point Δ ahead on that segment. This naturally corrects
-        crosstrack error (boat drifting sideways off the path due to
-        current/wind) without any extra control loop.
-
-    Multi-waypoint mission queue
-        The node now holds an ordered list of waypoints.
-        /usv/queue_add     (NavSatFix) — append one WP to the queue
-        /usv/mission_start (Bool)      — True: start queue / False: clear
+    Hardware Integration       Sensors migrated to /esp/... topics
+    Pivot Turn Fix             Instantly clears PI speed integrator on 180° turns
+    Parking Mode               Soft pause without killing the mission (/usv/park)
+    Failsafe Heartbeat         RTL to origin if dashboard disconnects for 10 mins
 
 Topics subscribed
 -----------------
-  /wamv/sensors/gps/gps/fix    sensor_msgs/NavSatFix
-  /wamv/sensors/imu/imu/data   sensor_msgs/Imu
-  /odometry/filtered            nav_msgs/Odometry         (robot_localization)
-  /usv/origin                   sensor_msgs/NavSatFix
-  /usv/target                   sensor_msgs/NavSatFix     (single immediate WP)
-  /usv/queue_add                sensor_msgs/NavSatFix     [NEW] append to queue
-  /usv/mission_start            std_msgs/Bool             [NEW] start / clear
-  /usv/estop                    std_msgs/Bool
-  /usv/hw_estop                 std_msgs/Bool
-  /usv/rc_override              geometry_msgs/Twist
+  /esp/gps/fix                 sensor_msgs/NavSatFix      (From ESP Microcontroller)
+  /esp/imu/data                sensor_msgs/Imu            (From ESP Microcontroller)
+  /odometry/filtered           nav_msgs/Odometry          (robot_localization)
+  /usv/origin                  sensor_msgs/NavSatFix      (Home point)
+  /usv/target                  sensor_msgs/NavSatFix      (Immediate WP)
+  /usv/queue_add               sensor_msgs/NavSatFix      (Append WP)
+  /usv/mission_start           std_msgs/Bool              (Start/Clear queue)
+  /usv/estop                   std_msgs/Bool              (Hard Kill)
+  /usv/hw_estop                std_msgs/Bool              (Physical Kill Switch)
+  /usv/rc_override             geometry_msgs/Twist        (Manual control)
+  /usv/park                    std_msgs/Bool              (Soft Pause)
+  /usv/heartbeat               std_msgs/Bool              (Dashboard connection ping)
 
 Topics published
 ----------------
-  /wamv/thrusters/left/thrust   std_msgs/Float64
-  /wamv/thrusters/right/thrust  std_msgs/Float64
+  /wamv/thrusters/left/thrust  std_msgs/Float64           (Read by thruster_driver_node)
+  /wamv/thrusters/right/thrust std_msgs/Float64           (Read by thruster_driver_node)
 """
 
 import math

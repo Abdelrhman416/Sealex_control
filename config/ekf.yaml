@@ -33,7 +33,7 @@
 #        name='navsat_transform_node',
 #        parameters=[os.path.join(pkg_share, 'config', 'ekf.yaml')],
 #        remappings=[
-#            ('imu/data',          '/wamv/sensors/imu/imu/data'),
+#            ('imu/data',          '/esp/imu/data'),
 #            ('gps/fix',           '/wamv/sensors/gps/gps/fix'),
 #            ('odometry/filtered', '/odometry/filtered'),
 #        ]
@@ -72,7 +72,7 @@ ekf_node:
 
     # ── IMU input (sensor 0) ───────────────────────────────────────────────
     # Topic remapped to /wamv/sensors/imu/imu/data in the launch file.
-    imu0: /wamv/sensors/imu/imu/data
+    imu0: /esp/imu/data
 
     # Configuration vector: which IMU fields to fuse.
     # Order: [x,  y,  z,           ← position (don't use from IMU)

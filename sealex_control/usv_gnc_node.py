@@ -38,8 +38,7 @@ Topics subscribed
 
 Topics published
 ----------------
-  /wamv/thrusters/left/thrust  std_msgs/Float64           (Read by thruster_driver_node)
-  /wamv/thrusters/right/thrust std_msgs/Float64           (Read by thruster_driver_node)
+    /esp/cmd_vel                 geometry_msgs/Twist        (To ESP Microcontroller)
 """
 
 import math
@@ -73,32 +72,6 @@ ALIGN_THRESHOLD  = math.radians(8)    # heading error → cut speed
 ALIGN_HYSTERESIS = math.radians(20)   # cut speed again if error exceeds this
 LOS_DELTA_M      = 8.0                # LOS lookahead distance (metres)
 
-# ===========================================================================
-# ─────────────────────────────────────────────────────────────────────────────
-#  THRUSTER CALIBRATION — Tune these FIRST on real hardware
-# ─────────────────────────────────────────────────────────────────────────────
-#
-#  THRUST_DEADBAND
-#    Minimum command magnitude that actually causes thruster movement.
-#    In simulation keep at 0.  On real hardware start at ~5 and increase
-#    until the boat stops hunting (oscillating at zero command).
-#
-#  LEFT_TRIM_OFFSET / RIGHT_TRIM_OFFSET
-#    Positive value adds to that side's thrust.
-#    If the boat drifts LEFT with equal commands → increase LEFT_TRIM_OFFSET
-#    (or decrease RIGHT_TRIM_OFFSET).  Tune in 1-unit steps.
-#
-#  THRUST_NONLIN_EXP
-#    1.0  = linear mapping  (simulation default)
-#    1.5  = gentler at low speed, more punch at high — good starting point
-#           for real Blue Robotics T200 thrusters
-#    2.0  = very non-linear; gives fine low-speed control at the cost of
-#           requiring larger commands for full thrust
-# ===========================================================================
-THRUST_DEADBAND    = 0.0    # [N-equivalent]  simulation: 0 / real: start ~5
-LEFT_TRIM_OFFSET   = 0.0    # [N-equivalent]  positive → more left thrust
-RIGHT_TRIM_OFFSET  = 0.0    # [N-equivalent]  positive → more right thrust
-THRUST_NONLIN_EXP  = 1.0    # 1.0 = linear.   Real hardware: try 1.5
 MAX_THRUSTER_N     = 100.0  # absolute clamp on final output
 
 # ===========================================================================
@@ -141,43 +114,6 @@ def clamp(value: float, lo: float, hi: float) -> float:
 def wrap_angle(a: float) -> float:
     """Wrap angle to (-pi, pi]."""
     return math.atan2(math.sin(a), math.cos(a))
-
-def apply_thrust_calibration(raw: float,
-                              trim: float,
-                              deadband: float,
-                              exp: float,
-                              max_thrust: float) -> float:
-    """
-    Transform a raw thrust command into a calibrated output.
-
-    Steps
-    -----
-    1. Add per-side trim offset.
-    2. Zero-out anything inside the deadband.
-    3. Apply a nonlinear power curve (sign preserved).
-    4. Clamp to [-max_thrust, +max_thrust].
-
-    Parameters
-    ----------
-    raw       : Thrust in nominal thrust units before calibration.
-    trim      : Per-side trim offset (positive → more thrust on this side).
-    deadband  : Commands with |val| < deadband are zeroed.
-    exp       : Power-curve exponent.  1.0 = linear.
-    max_thrust: Hard output limit.
-    """
-    val = raw + trim
-
-    # Deadband
-    if abs(val) < deadband:
-        return 0.0
-
-    sign      = 1.0 if val > 0.0 else -1.0
-    span      = max_thrust - deadband           # usable range above deadband
-    above_db  = abs(val) - deadband             # distance above deadband
-    norm      = clamp(above_db / span, 0.0, 1.0)
-    curved    = math.pow(norm, exp) * span + deadband
-    return clamp(sign * curved, -max_thrust, max_thrust)
-
 
 # ===========================================================================
 # GNC Node
@@ -261,11 +197,9 @@ class USVGNCNode(Node):
         self.create_subscription(Bool, '/usv/park', self.park_callback, 10)
         self.create_subscription(Bool, '/usv/heartbeat', self.heartbeat_callback, 10)
 
-        # ── Publishers ─────────────────────────────────────────────────────
-        self.left_pub  = self.create_publisher(
-            Float64, '/wamv/thrusters/left/thrust',  10)
-        self.right_pub = self.create_publisher(
-            Float64, '/wamv/thrusters/right/thrust', 10)
+        #── Publishers ─────────────────────────────────────────────────────
+        # Publishing a single Twist message to the ESP via micro-ROS
+        self.cmd_vel_pub = self.create_publisher(Twist, '/esp/cmd_vel', 10)
 
         # ── Control-loop timer ─────────────────────────────────────────────
         self.dt           = 0.1
@@ -321,7 +255,7 @@ class USVGNCNode(Node):
         self.last_rc_time       = None
 
         # ── Speed / mission params ─────────────────────────────────────────
-        self.v_desired = 2.0   # cruise speed m/s
+        self.v_desired = 3.0   # cruise speed m/s
         self.R_accept  = 1.5   # waypoint acceptance radius m
 
        # ── Heading controller state ───────────────────────────────────────
@@ -330,7 +264,7 @@ class USVGNCNode(Node):
         self.max_angular_speed = 0.8   # rad/s
 
         # ── Thruster limits ────────────────────────────────────────────────
-        self.max_linear_speed = 2.0
+        self.max_linear_speed = 3.6  # Theoretical max speed of WAM-V in m/s (for guidance scaling)
         self.L = 2.0    # ← MEASURE THIS on the real WAM-V (thruster separation, m)
 
         # ── Start-up banner ────────────────────────────────────────────────
@@ -381,30 +315,12 @@ class USVGNCNode(Node):
         """Seconds since last_time."""
         return (self.get_clock().now() - last_time).nanoseconds / 1e9
 
-    def _publish_thrust(self, left_raw: float, right_raw: float) -> None:
-        """
-        Apply thruster calibration and publish.
-        All thrust commands flow through here — single point of calibration.
-        """
-        left_cal  = apply_thrust_calibration(
-            left_raw,  LEFT_TRIM_OFFSET,  THRUST_DEADBAND,
-            THRUST_NONLIN_EXP, MAX_THRUSTER_N)
-        right_cal = apply_thrust_calibration(
-            right_raw, RIGHT_TRIM_OFFSET, THRUST_DEADBAND,
-            THRUST_NONLIN_EXP, MAX_THRUSTER_N)
-
-        msg_l = Float64(); msg_l.data = left_cal
-        msg_r = Float64(); msg_r.data = right_cal
-        self.left_pub.publish(msg_l)
-        self.right_pub.publish(msg_r)
-
     def stop_boat(self) -> None:
-        """Publish zero thrust safely (used by E-STOP and watchdog)."""
+        """Publish zero velocity safely (used by E-STOP and watchdog)."""
         try:
-            msg = Float64()
-            msg.data = 0.0
-            self.left_pub.publish(msg)
-            self.right_pub.publish(msg)
+            msg = Twist()
+            # Twist messages default to 0.0 for all values automatically
+            self.cmd_vel_pub.publish(msg)
         except Exception as ex:
             print(f'[stop_boat] Could not publish: {ex}')
 
@@ -965,16 +881,14 @@ class USVGNCNode(Node):
         # Thrust for that speed (closed-loop PI or open-loop)
         thrust_fwd = self._compute_thrust_for_speed(v_cmd)
 
-        # Differential thrust mixing
-        left_raw  = thrust_fwd - omega * self.L / 2.0 * (MAX_THRUSTER_N / self.max_linear_speed)
-        right_raw = thrust_fwd + omega * self.L / 2.0 * (MAX_THRUSTER_N / self.max_linear_speed)
+        # Scale angular velocity (omega) into a turning effort (matching thrust units)
+        yaw_effort = omega * self.L / 2.0 * (MAX_THRUSTER_N / self.max_linear_speed)
 
-        # Clamp raw before calibration
-        left_raw  = clamp(left_raw,  -MAX_THRUSTER_N, MAX_THRUSTER_N)
-        right_raw = clamp(right_raw, -MAX_THRUSTER_N, MAX_THRUSTER_N)
-
-        # Publish (calibration layer is inside _publish_thrust)
-        self._publish_thrust(left_raw, right_raw)
+        # Create and publish Twist message to the ESP
+        msg = Twist()
+        msg.linear.x = thrust_fwd
+        msg.angular.z = yaw_effort
+        self.cmd_vel_pub.publish(msg)
 
         # ── Telemetry (every 10 ticks = 1 s) ──────────────────────────────
         self.print_counter += 1
@@ -989,7 +903,7 @@ class USVGNCNode(Node):
                 f'Dist={distance:.2f}m  '
                 f'vCmd={v_cmd:.2f} Fwd={thrust_fwd:.1f}  '
                 f'ω={omega:.2f}  '
-                f'T:L={left_raw:.1f} R={right_raw:.1f}')
+                f'YawEffort={yaw_effort:.1f}')
             self.print_counter = 0
 
     # =========================================================================
@@ -998,28 +912,22 @@ class USVGNCNode(Node):
 
     def _execute_rc_override(self) -> None:
         """
-        Map RC Twist commands to thruster outputs.
-
-        Scaling:
-          forward thrust  = rc_linear  * MAX_THRUSTER_N
-          turn moment     = rc_angular * MAX_THRUSTER_N
-        Differential mixing is identical to autonomous mode.
-        Calibration layer is applied via _publish_thrust.
+        Map RC commands to a Twist message for the ESP.
         """
         fwd_thrust = self.rc_linear  * MAX_THRUSTER_N
         yaw_thrust = self.rc_angular * MAX_THRUSTER_N
 
-        left_raw  = clamp(fwd_thrust - yaw_thrust, -MAX_THRUSTER_N, MAX_THRUSTER_N)
-        right_raw = clamp(fwd_thrust + yaw_thrust, -MAX_THRUSTER_N, MAX_THRUSTER_N)
-
-        self._publish_thrust(left_raw, right_raw)
+        msg = Twist()
+        msg.linear.x = fwd_thrust
+        msg.angular.z = yaw_thrust
+        self.cmd_vel_pub.publish(msg)
 
         self.print_counter += 1
         if self.print_counter >= 10:
             self.get_logger().info(
                 f'[RC-OVERRIDE]  fwd={self.rc_linear:+.2f}  '
                 f'yaw={self.rc_angular:+.2f}  '
-                f'T:L={left_raw:.1f} R={right_raw:.1f}')
+                f'FwdEffort={fwd_thrust:.1f} YawEffort={yaw_thrust:.1f}')
             self.print_counter = 0
 
 

@@ -33,7 +33,7 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, LogInfo
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
@@ -68,8 +68,8 @@ def generate_launch_description():
         output='screen',
         parameters=[ekf_config],
         remappings=[
-            ('imu/data',           '/wamv/sensors/imu/imu/data'),
-            ('gps/fix',            '/wamv/sensors/gps/gps/fix'),
+            ('imu/data',           '/esp/imu/data'),  # Real Hardware Topic
+            ('gps/fix',            '/esp/gps/fix'),   # Real Hardware Topic
             ('odometry/filtered',  '/odometry/filtered'),
             ('odometry/gps',       '/odometry/gps'),
         ],
@@ -94,7 +94,7 @@ def generate_launch_description():
         parameters=[ekf_config],
         remappings=[
             ('odometry/filtered', '/odometry/filtered'),
-            ('imu0',              '/wamv/sensors/imu/imu/data'),
+            ('imu0',              '/esp/imu/data'),   # Real Hardware Topic
             ('odom0',             '/odometry/gps'),
         ],
     )
@@ -119,11 +119,10 @@ def generate_launch_description():
 
     return LaunchDescription([
         ekf_debug_arg,
-        LogInfo(msg='[SEALEX] Starting navsat_transform_node ...'),
+        LogInfo(msg='[SEALEX] Starting RH navsat_transform_node ...'),
         navsat_node,
-        LogInfo(msg='[SEALEX] Starting ekf_node ...'),
+        LogInfo(msg='[SEALEX] Starting RH ekf_node ...'),
         ekf_node,
-        LogInfo(msg='[SEALEX] Starting usv_gnc_node ...'),
+        LogInfo(msg='[SEALEX] Starting RH usv_gnc_node ...'),
         gnc_node,
-        ekf_echo,
     ])

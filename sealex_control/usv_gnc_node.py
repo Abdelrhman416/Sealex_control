@@ -46,7 +46,7 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import NavSatFix, Imu
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Float64, Bool
+from std_msgs.msg import Float64, Bool, Int32
 from geometry_msgs.msg import Twist
 
 # ===========================================================================
@@ -130,6 +130,14 @@ class USVGNCNode(Node):
         self.gps_sub = self.create_subscription(
             NavSatFix, '/esp/gps/fix',
             self.gps_callback, 10)
+        
+        # ── [NEW] Skimmer Relay ────────────────────────────────────────────
+        # Listen to the AI Vision node
+        self.ai_filter_sub = self.create_subscription(
+            Int32, '/cmd_filter', self.ai_filter_callback, 10)
+            
+        # Send command to the ESP32 / STM32
+        self.skimmer_pub = self.create_publisher(Int32, '/esp/skimmer_cmd', 10)
 
         # Raw IMU — always subscribed for heading
         self.imu_sub = self.create_subscription(
@@ -557,6 +565,31 @@ class USVGNCNode(Node):
                 self.get_logger().warn(
                     '\n⚠  [HW-ESTOP]  Hardware E-STOP cleared. '
                     'Send a new /usv/target to resume.\n')
+                
+
+    # =========================================================================
+    # Callbacks — AI Vision Skimmer Relay
+    # =========================================================================
+
+    def ai_filter_callback(self, msg: Int32) -> None:
+        """
+        Receives skimmer command from AI Vision node:
+        0 = OFF
+        1 = ON (Oil is within 2 meters)
+        2 = OIL DETECTED (But far away)
+        
+        We only want to send 0 or 1 to the ESP32 to actually spin the motor.
+        """
+        esp_msg = Int32()
+        
+        if msg.data == 1:
+            esp_msg.data = 1
+            self.get_logger().info('🟢 [SKIMMER] Oil is close! Sending ON command to ESP32.', throttle_duration_sec=2.0)
+        else:
+            esp_msg.data = 0
+            # We don't need to spam the logs when it's off
+            
+        self.skimmer_pub.publish(esp_msg)
 
     # =========================================================================
     # Callbacks — RC Override

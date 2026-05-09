@@ -1,192 +1,206 @@
-#!/usr/bin/env python3
-"""
-SEALEX AI Vision Node
-=====================
-Runs YOLOv8 object detection on a camera feed and publishes Twist commands
-to avoid obstacles or navigate towards oil spills.
-"""
-
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist
-from std_msgs.msg import String # Optional: For publishing UI status
+from std_msgs.msg import Int32
+
+# ── Vision & Inference ───────────────────────────────────────────────
 import cv2
-from ultralytics import YOLO
-
-# =====================
-# Constants
-# =====================
-K = 5000
-
-OIL_CLASSES = ["oil_spill"]
-SHIP_CLASSES = ["ship"]
-
-# Speed Constants for Twist Messages (Adjust these for your boat!)
-FORWARD_SPEED = 1.0     # m/s
-TURN_EFFORT   = 50.0    # Matching the units expected by your GNC node
-
-OIL_STOP_DISTANCE       = 2
-OBSTACLE_AVOID_DISTANCE = 5
+import numpy as np
+import onnxruntime as ort   # Requirement: pip install onnxruntime
 
 class AIVisionNode(Node):
+
+    # ─────────────────────────────────────────────────────────────────
+    # 1.  CONSTANTS
+    # ─────────────────────────────────────────────────────────────────
+    K                       = 5000
+    OIL_CLASSES             = ["oil_spill"]
+    SHIP_CLASSES            = ["ship"]
+
+    STOP    = 0
+    RIGHT   = 1
+    LEFT    = 2
+    FORWARD = 3
+
+    FILTER_OFF   = 0
+    FILTER_ON    = 1
+    OIL_DETECTED = 2
+
+    OIL_STOP_DISTANCE       = 2   # metres — stop & collect
+    OBSTACLE_AVOID_DISTANCE = 5   # metres — start avoidance
+
+    # ── Inference settings ───────────────────────────────────────────
+    # USE THE ABSOLUTE PATH HERE
+    MODEL_PATH   = "/home/usv/sealex_ws/best.onnx" 
+    IMG_SIZE     = 640
+    CONF_OIL     = 0.55           
+    CONF_GENERAL = 0.25
+    NMS_IOU      = 0.45
+
     def __init__(self):
         super().__init__('ai_vision_node')
 
-        # 1. Create Publishers
-        # We publish to /usv/rc_override so the GNC node handles priority
-        self.cmd_vel_pub = self.create_publisher(Twist, '/usv/rc_override', 10)
-        
-        # Optional: Publish status for a dashboard
-        self.status_pub = self.create_publisher(String, '/ai/status', 10)
+        # ── ROS2 publishers ──────────────────────────────────────────
+        self.motor_pub  = self.create_publisher(Int32, '/cmd_motor',  10)
+        self.filter_pub = self.create_publisher(Int32, '/cmd_filter', 10)
 
-        # 2. Load the YOLO Model
-        self.get_logger().info("Loading YOLO Model...")
-        # Make sure 'best.pt' is in the same directory, or provide the full path
-        self.model = YOLO("best.pt") 
-        self.get_logger().info("Model Loaded!")
+        # ── Anti-spam: remember last sent command ────────────────────
+        self.last_motor_cmd  = -1
+        self.last_filter_cmd = -1
 
-        # 3. Initialize Camera
-        self.cap = cv2.VideoCapture(0)
-        if not self.cap.isOpened():
-            self.get_logger().error("❌ Camera Error: Could not open /dev/video0")
-            # You might want to handle this more gracefully, but for now, exit.
-            exit()
+        # ── Load model ───────────────────────────────────────────────
+        self.get_logger().info(f"Loading YOLO Model (ONNX) from {self.MODEL_PATH}...")
 
-        # 4. Start the Vision Loop Timer (e.g., 10 Hz)
-        self.timer = self.create_timer(0.1, self.vision_loop)
-
-        self.last_motor_cmd = "FORWARD"
-        self.last_filter_cmd = "FILTER_OFF"
-        self.get_logger().info("✅ AI Vision Node Running...")
-
-    def get_direction(self, obj_center, center_x):
-        if obj_center < center_x - 50:
-            return "LEFT"
-        elif obj_center > center_x + 50:
-            return "RIGHT"
-        else:
-            return "CENTER"
-
-    def send_motor_command(self, linear_x, angular_z, label):
-        """Creates and publishes the Twist message."""
-        if label != self.last_motor_cmd:
-            self.get_logger().info(f"[MOTOR] → {label}")
-            self.last_motor_cmd = label
-
-        msg = Twist()
-        msg.linear.x = float(linear_x)
-        msg.angular.z = float(angular_z)
-        self.cmd_vel_pub.publish(msg)
-
-    def send_filter_command(self, status):
-        """Publishes the filter status (Optional)."""
-        if status != self.last_filter_cmd:
-             self.get_logger().info(f"[FILTER] → {status}")
-             self.last_filter_cmd = status
-             
-             status_msg = String()
-             status_msg.data = status
-             self.status_pub.publish(status_msg)
-
-    def vision_loop(self):
-        ret, frame = self.cap.read()
-        if not ret:
-            self.get_logger().warn("Failed to grab frame")
+        try:
+            self.session = ort.InferenceSession(
+                self.MODEL_PATH,
+                providers=["CPUExecutionProvider"]  # Best for Raspberry Pi ARM
+            )
+            self.input_name = self.session.get_inputs()[0].name
+        except Exception as e:
+            self.get_logger().error(f"Failed to load ONNX model: {e}")
             return
 
-        h, w, _ = frame.shape
+        # Class names must match your training order
+        self.class_names = ["oil_spill", "ship"]
+
+        # ── Camera ───────────────────────────────────────────────────
+        # Switch to your RTSP stream if mediamtx is running:
+        # self.cap = cv2.VideoCapture("rtsp://127.0.0.1:8554/stream")
+        self.cap = cv2.VideoCapture(0)
+        
+        if not self.cap.isOpened():
+            self.get_logger().error("❌ Camera Error: Could not open video source")
+
+        # ── 20 Hz timer ──────────────────────────────────────────────
+        self.timer = self.create_timer(0.05, self.loop)
+        self.get_logger().info("✅ AI Vision Node (ONNX) Running...")
+
+    # ─────────────────────────────────────────────────────────────────
+    # 2.  ONNX INFERENCE HELPERS
+    # ─────────────────────────────────────────────────────────────────
+    def preprocess(self, frame):
+        img = cv2.resize(frame, (self.IMG_SIZE, self.IMG_SIZE))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = img.astype(np.float32) / 255.0
+        img = np.transpose(img, (2, 0, 1))
+        img = np.expand_dims(img, axis=0)
+        return img
+
+    def nms(self, boxes, scores, iou_threshold=0.45):
+        if len(boxes) == 0: return []
+        x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+        areas = (x2 - x1) * (y2 - y1)
+        order = scores.argsort()[::-1]
+        keep = []
+        while order.size > 0:
+            i = order[0]
+            keep.append(i)
+            xx1, yy1 = np.maximum(x1[i], x1[order[1:]]), np.maximum(y1[i], y1[order[1:]])
+            xx2, yy2 = np.minimum(x2[i], x2[order[1:]]), np.minimum(y2[i], y2[order[1:]])
+            w, h = np.maximum(0.0, xx2 - xx1), np.maximum(0.0, yy2 - yy1)
+            inter = w * h
+            iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
+            order = order[1:][iou < iou_threshold]
+        return keep
+
+    def run_inference(self, frame):
+        h_orig, w_orig = frame.shape[:2]
+        inp = self.preprocess(frame)
+        outputs = self.session.run(None, {self.input_name: inp})
+        predictions = np.squeeze(outputs[0]) # [4+num_classes, 8400]
+        predictions = predictions.T # [8400, 6]
+
+        boxes_all, scores_all, cls_all = [], [], []
+        for pred in predictions:
+            cls_scores = pred[4:]
+            cls_id = np.argmax(cls_scores)
+            conf = cls_scores[cls_id]
+            if conf < self.CONF_GENERAL: continue
+            
+            cx, cy, bw, bh = pred[0], pred[1], pred[2], pred[3]
+            sx, sy = w_orig / self.IMG_SIZE, h_orig / self.IMG_SIZE
+            x1, y1 = (cx - bw/2) * sx, (cy - bh/2) * sy
+            x2, y2 = (cx + bw/2) * sx, (cy + bh/2) * sy
+            
+            boxes_all.append([x1, y1, x2, y2])
+            scores_all.append(conf)
+            cls_all.append(cls_id)
+
+        if not boxes_all: return []
+        keep = self.nms(np.array(boxes_all), np.array(scores_all), self.NMS_IOU)
+        return [{"name": self.class_names[cls_all[i]], "conf": scores_all[i], "box": boxes_all[i]} for i in keep]
+
+    # ─────────────────────────────────────────────────────────────────
+    # 3.  LOGIC & LOOP (UNCHANGED DECISION TREE)
+    # ─────────────────────────────────────────────────────────────────
+    def get_direction(self, obj_center, center_x):
+        if obj_center < center_x - 50: return "LEFT"
+        if obj_center > center_x + 50: return "RIGHT"
+        return "CENTER"
+
+    def send_motor(self, value: int):
+        if value == self.last_motor_cmd: return
+        msg = Int32(); msg.data = value
+        self.motor_pub.publish(msg)
+        self.last_motor_cmd = value
+        labels = {0:"STOP", 1:"RIGHT", 2:"LEFT", 3:"FORWARD"}
+        self.get_logger().info(f"[MOTOR]  → {labels.get(value)}")
+
+    def send_filter(self, value: int):
+        if value == self.last_filter_cmd: return
+        msg = Int32(); msg.data = value
+        self.filter_pub.publish(msg)
+        self.last_filter_cmd = value
+        labels = {0:"FILTER_OFF", 1:"FILTER_ON", 2:"OIL_DETECTED"}
+        self.get_logger().info(f"[FILTER] → {labels.get(value)}")
+
+    def loop(self):
+        ret, frame = self.cap.read()
+        if not ret: return
+
+        h, w = frame.shape[:2]
         center_x = w // 2
+        detections = self.run_inference(frame)
 
-        results = self.model(frame, verbose=False) # verbose=False keeps terminal clean
+        oil_detected, oil_close, oil_direction = False, False, "CENTER"
+        closest_obstacle, closest_distance = None, float('inf')
 
-        oil_detected = False
-        oil_close = False
-        closest_obstacle = None
-        closest_distance = float('inf')
+        for det in detections:
+            name, conf, (x1, y1, x2, y2) = det["name"], det["conf"], det["box"]
+            area = (x2 - x1) * (y2 - y1)
+            if area <= 0: continue
+            distance = self.K / (area ** 0.5)
+            obj_center = (x1 + x2) / 2
 
-        # =====================
-        # DETECTION
-        # =====================
-        for r in results:
-            for box in r.boxes:
-                x1, y1, x2, y2 = box.xyxy[0]
-                cls = int(box.cls[0])
-                name = self.model.names[cls]
-                conf = float(box.conf[0])
+            if name in self.OIL_CLASSES and conf > self.CONF_OIL:
+                oil_detected = True
+                oil_direction = self.get_direction(obj_center, center_x)
+                if distance <= self.OIL_STOP_DISTANCE: oil_close = True
+            else:
+                if distance < closest_distance:
+                    closest_distance = distance
+                    closest_obstacle = {"distance": distance, "obj_center": obj_center}
 
-                area = (x2 - x1) * (y2 - y1)
-                if area == 0:
-                    continue
-
-                distance = K / (area ** 0.5)
-                obj_center = (x1 + x2) / 2
-
-                # OIL
-                if name in OIL_CLASSES and conf > 0.4:
-                    oil_detected = True
-                    oil_direction = self.get_direction(obj_center, center_x)
-
-                    if distance <= OIL_STOP_DISTANCE:
-                        oil_close = True
-
-                # OBSTACLES (ship included)
-                else:
-                    if distance < closest_distance:
-                        closest_distance = distance
-                        closest_obstacle = {
-                            "distance": distance,
-                            "obj_center": obj_center
-                        }
-
-        # =====================
-        # DECISION & PUBLISHING
-        # =====================
+        # Priority Tree
         if oil_close:
-            self.send_motor_command(0.0, 0.0, "STOP")
-            self.send_filter_command("FILTER_ON")
-
+            self.send_motor(self.STOP); self.send_filter(self.FILTER_ON)
         elif oil_detected:
-            self.send_filter_command("OIL_DETECTED")
-            if oil_direction == "LEFT":
-                 # Turn Left: Zero forward speed, positive angular speed
-                self.send_motor_command(0.0, TURN_EFFORT, "LEFT")
-            elif oil_direction == "RIGHT":
-                # Turn Right: Zero forward speed, negative angular speed
-                self.send_motor_command(0.0, -TURN_EFFORT, "RIGHT")
-            else:
-                self.send_motor_command(FORWARD_SPEED, 0.0, "FORWARD")
-
-        elif closest_obstacle and closest_obstacle["distance"] <= OBSTACLE_AVOID_DISTANCE:
-            self.send_filter_command("FILTER_OFF")
-            direction = self.get_direction(closest_obstacle["obj_center"], center_x)
-
-            if direction == "RIGHT":
-                 # Turn Left to avoid
-                self.send_motor_command(0.0, TURN_EFFORT, "AVOID LEFT")
-            elif direction == "LEFT":
-                 # Turn Right to avoid
-                self.send_motor_command(0.0, -TURN_EFFORT, "AVOID RIGHT")
-            else:
-                 # Default avoid right
-                self.send_motor_command(0.0, -TURN_EFFORT, "AVOID RIGHT")
-
+            self.send_filter(self.OIL_DETECTED)
+            cmd = {"LEFT": self.LEFT, "RIGHT": self.RIGHT, "CENTER": self.FORWARD}
+            self.send_motor(cmd[oil_direction])
+        elif closest_obstacle and closest_obstacle["distance"] <= self.OBSTACLE_AVOID_DISTANCE:
+            self.send_filter(self.FILTER_OFF)
+            obs_dir = self.get_direction(closest_obstacle["obj_center"], center_x)
+            self.send_motor(self.LEFT if obs_dir == "RIGHT" else self.RIGHT)
         else:
-             # Safe to cruise
-            self.send_filter_command("FILTER_OFF")
-            self.send_motor_command(FORWARD_SPEED, 0.0, "FORWARD")
+            self.send_motor(self.FORWARD); self.send_filter(self.FILTER_OFF)
 
-
-def main(args=None):
-    rclpy.init(args=args)
+def main():
+    rclpy.init()
     node = AIVisionNode()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        node.get_logger().info("Shutting down AI Vision Node.")
-    finally:
-        node.cap.release()
-        node.destroy_node()
-        rclpy.shutdown()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
 
 if __name__ == "__main__":
     main()

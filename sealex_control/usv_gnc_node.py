@@ -430,34 +430,18 @@ class USVGNCNode(Node):
 
     def _compute_velocity_command(self, distance: float,
                                    heading_error: float) -> float:
-        abs_e = abs(heading_error)
-
-        # Hysteresis alignment state machine:
-        # - When _is_aligned is False: spin in place until error < ALIGN_THRESHOLD
-        # - Once moving: keep moving until error > ALIGN_HYSTERESIS
-        # This prevents the orbit caused by starting forward motion too early.
-        if not self._is_aligned:
-            if abs_e > ALIGN_THRESHOLD:
-                return 0.0          # still spinning to align — no forward motion
-            else:
-                self._is_aligned = True   # locked on — start moving
-
-        else:  # currently moving forward
-            if abs_e > ALIGN_HYSTERESIS:
-                self._is_aligned = False  # lost alignment — stop and re-align
-                return 0.0
-
-        # Forward speed profile (only reached when aligned)
+        # 1. Forward speed profile based purely on distance
         if distance >= SLOW_ZONE_M:
             v = self.v_desired
         else:
             t = (distance - self.R_accept) / (SLOW_ZONE_M - self.R_accept)
             v = MIN_SPEED + clamp(t, 0.0, 1.0) * (self.v_desired - MIN_SPEED)
 
-        # Gentle slow-down for small residual heading error (5°–20°)
-        if abs_e > math.radians(5):
-            penalty = 1.0 - 0.3 * (abs_e - math.radians(5)) / (ALIGN_HYSTERESIS - math.radians(5))
-            v *= clamp(penalty, 0.7, 1.0)
+        # 2. Heading penalty (Slightly slow down on sharp turns, but NEVER stop)
+        abs_e = abs(heading_error)
+        # Max 50% speed reduction if facing completely the wrong way
+        penalty = 1.0 - (abs_e / math.pi) * 0.5 
+        v *= clamp(penalty, 0.5, 1.0)
 
         return clamp(v, 0.0, self.max_linear_speed)
 

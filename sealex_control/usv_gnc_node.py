@@ -72,19 +72,19 @@ ALIGN_THRESHOLD  = math.radians(8)    # heading error → cut speed
 ALIGN_HYSTERESIS = math.radians(20)   # cut speed again if error exceeds this
 LOS_DELTA_M      = 8.0                # LOS lookahead distance (metres)
 
-MAX_THRUSTER_N     = 100.0  # absolute clamp on final output
+MAX_THRUSTER_N     = 3.6  # absolute clamp on final output
 
 # ===========================================================================
 # Open-loop fallback gain (used when EKF is not running)
 # ===========================================================================
-OPEN_LOOP_GAIN = 45.0   # maps m/s command → thrust units  (empirical)
+OPEN_LOOP_GAIN = 1.0   # maps m/s command → thrust units  (empirical)
 
 # ===========================================================================
 # Closed-loop speed controller gains (active when EKF is running)
 # ===========================================================================
-KP_V = 40.0     # proportional gain  (surge speed error → thrust)
-KI_V =  5.0     # integral gain
-V_INTEGRAL_LIMIT = 3.0  # anti-windup clamp on integral accumulator
+KP_V = 0.8     # proportional gain  (surge speed error → thrust)
+KI_V =  0.1     # integral gain
+V_INTEGRAL_LIMIT = 0.5  # anti-windup clamp on integral accumulator
 
 # ===========================================================================
 # PID heading controller gains
@@ -234,7 +234,7 @@ class USVGNCNode(Node):
         self.ekf_vy_world   = 0.0   # velocity in world (odom) frame — north
         self.last_ekf_time  = self.get_clock().now()
         self._ekf_watchdog_active = False
-
+        self.ekf_yaw_rate   = 0.0   # spin speed, rad/s
         # PI speed controller state
         self.v_integral = 0.0
 
@@ -355,29 +355,23 @@ class USVGNCNode(Node):
             return 0.0
         
         if self.ekf_alive:
-            # Project world-frame velocity onto boat's forward axis (body surge)
-            v_actual = (self.ekf_vx_world * math.cos(self.psi) +
-                        self.ekf_vy_world * math.sin(self.psi))
-    
+        # ekf_surge is already the forward body speed — no rotation needed
+        # ekf_sway is sideways slip — boats mostly ignore this
+        # ekf_yaw_rate lets us correct for spin stealing forward momentum
+            v_actual = self.ekf_vx_world
+
             v_error = v_command - v_actual
 
-            # Integrate with anti-windup
-            if self.ekf_alive:
-               v_actual = (self.ekf_vx_world * math.cos(self.psi) +
-                           self.ekf_vy_world * math.sin(self.psi))
-               v_error = v_command - v_actual
+            thrust = KP_V * v_error + KI_V * self.v_integral
 
-               thrust = KP_V * v_error + KI_V * self.v_integral
-               output = clamp(thrust, 0.0, MAX_THRUSTER_N)
+            output = clamp(thrust, 0.0, MAX_THRUSTER_N)
 
-               # Anti-windup: only integrate when output is NOT saturated
-               if output < MAX_THRUSTER_N:
-                   self.v_integral = clamp(
-                       self.v_integral + v_error * self.dt,
-                       -V_INTEGRAL_LIMIT, V_INTEGRAL_LIMIT)
+            if output < MAX_THRUSTER_N:
+                self.v_integral = clamp( self.v_integral + v_error * self.dt,-V_INTEGRAL_LIMIT, V_INTEGRAL_LIMIT)
+
             return output
+
         else:
-            # Open-loop: reset integrator so there's no bump on EKF reconnect
             self.v_integral = 0.0
             return clamp(v_command * OPEN_LOOP_GAIN, 0.0, MAX_THRUSTER_N)
         
@@ -416,13 +410,16 @@ class USVGNCNode(Node):
         PID yaw-rate controller. Returns (omega, heading_error).
         """
         e     = wrap_angle(psi_desired - self.psi)
-        e_dot = (e - self.prev_e) / self.dt
 
-        self.e_integral = clamp(
-            self.e_integral + e * self.dt,
-            -PSI_INTEGRAL_LIMIT, PSI_INTEGRAL_LIMIT)
+        if self.ekf_alive:
+            e_dot = -self.ekf_yaw_rate   # negative because yaw_rate > 0 means
+                                      # we are already turning left, so less correction needed
+        else:
+            e_dot = (e - self.prev_e) / self.dt
 
-        omega      = KP_PSI * e + KD_PSI * e_dot + KI_PSI * self.e_integral
+        self.e_integral = clamp(self.e_integral + e * self.dt,-PSI_INTEGRAL_LIMIT, PSI_INTEGRAL_LIMIT)
+
+        omega = KP_PSI * e + KD_PSI * e_dot + KI_PSI * self.e_integral
         self.prev_e = e
 
         return clamp(omega, -self.max_angular_speed, self.max_angular_speed), e
@@ -679,6 +676,7 @@ class USVGNCNode(Node):
         # speed controller (psi rotation applied there).
         self.ekf_vx_world = msg.twist.twist.linear.x
         self.ekf_vy_world = msg.twist.twist.linear.y
+        self.ekf_yaw_rate = msg.twist.twist.angular.z
         self.last_ekf_time = self.get_clock().now()
 
         if self._ekf_watchdog_active:
@@ -915,7 +913,7 @@ class USVGNCNode(Node):
         thrust_fwd = self._compute_thrust_for_speed(v_cmd)
 
         # Scale angular velocity (omega) into a turning effort (matching thrust units)
-        yaw_effort = omega * self.L / 2.0 * (MAX_THRUSTER_N / self.max_linear_speed)
+        yaw_effort = omega * self.L / 2.0 
 
         # Create and publish Twist message to the ESP
         msg = Twist()

@@ -30,6 +30,7 @@ setup(
             'imu_cal_check = sealex_control.imu_cal_check:main',
             'thruster_driver_node = sealex_control.thruster_driver_node:main',
             'ai_vision_node = sealex_control.ai_vision_node:main',
+            'fake_gps_node = sealex_control.fake_gps_node:main',
         ],
     },
 )

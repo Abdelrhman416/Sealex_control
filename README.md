@@ -6,7 +6,7 @@
 
 ## System Architecture & Tech Stack
 The control system adopts a distributed architecture combining high-level autonomous navigation with low-level hardware actuation:
-* **High-Level Control & Navigation:** ROS 2 Humble (Python / C++) running on a Raspberry Pi 4.
+* **High-Level Control & Navigation:** ROS 2 Humble (Python) running on a Raspberry Pi 4.
 * **Simulation Environment:** Gazebo for hydrodynamic modeling and sensor simulation.
 * **Kinematics & Control Design:** MATLAB and Simulink (Line-of-Sight [LOS] guidance, PID heading control, and differential thrust allocation).
 * **Low-Level Microcontrollers:** ESP32 handling actuator interfaces, PWM motor signals, and sensor polling.
